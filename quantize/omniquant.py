@@ -51,6 +51,26 @@ class LoraLinear(nn.Module):
         lora_out = (x @ self.lora_A @ self.lora_B) * self.scaling
         return base_out + lora_out
 
+    def get_merged_linear(self) -> nn.Linear:
+        """
+        Return a standard nn.Linear with LoRA weights merged into the base weights.
+        merged_weight = weight + (lora_A @ lora_B).T * scaling
+        """
+        # Create a new Linear layer with the same dimensions
+        merged_linear = nn.Linear(self.in_features, self.out_features, bias=self.bias is not None)
+        
+        # Compute the LoRA delta: (lora_A @ lora_B).T gives shape [out_features, in_features]
+        lora_delta = (self.lora_A @ self.lora_B).T * self.scaling
+        
+        # Merge weights: original weight + LoRA delta (ensure device and dtype compatibility)
+        merged_linear.weight.data = self.weight.data + lora_delta.to(device=self.weight.device, dtype=self.weight.dtype)
+        
+        # Copy bias if it exists
+        if self.bias is not None:
+            merged_linear.bias.data = self.bias.data.clone()
+        
+        return merged_linear
+
 
 try:
     import auto_gptq.nn_modules.qlinear.qlinear_cuda as qlinear_cuda

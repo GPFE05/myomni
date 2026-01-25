@@ -10,7 +10,7 @@ from lm_eval import evaluator
 from pprint import pprint
 from parallel_utils import map_layers_to_multi_gpus, get_lowest_occupied_gpu
 import torch.nn as nn
-from quantize.omniquant import omniquant
+from quantize.omniquant import omniquant, LoraLinear, add_new_module
 from tqdm import tqdm
 import utils
 from pathlib import Path
@@ -21,6 +21,18 @@ from models.int_opt_layer import QuantOPTDecoderLayer
 from quantize.int_linear import QuantLinear
 
 import pdb
+
+
+def merge_lora_layers(model):
+    """
+    Replace all LoraLinear layers with standard nn.Linear layers containing merged weights.
+    This ensures the trained LoRA weights are preserved when saving with save_pretrained().
+    """
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLinear):
+            # Get the merged linear layer and replace the LoraLinear module
+            merged_linear = module.get_merged_linear()
+            add_new_module(name, model, merged_linear)
 
 
 torch.backends.cudnn.benchmark = True
@@ -367,7 +379,10 @@ def main():
                     del module.out_smooth_scale
                     del module.out_smooth_shift
                     del module.fc1_smooth_scale
-                    del module.fc1_smooth_shift           
+                    del module.fc1_smooth_shift
+        # Merge LoRA weights into base weights before saving (for Mixtral gate layers)
+        # This ensures the trained LoRA parameters are preserved as standard Linear layers
+        merge_lora_layers(lm.model)
         lm.model.save_pretrained(args.save_dir)  
         lm.tokenizer.save_pretrained(args.save_dir) 
     evaluate(lm, args,logger)
