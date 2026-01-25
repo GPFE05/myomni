@@ -5,6 +5,17 @@ from quantize.int_matmul import QuantMatMul
 from models.transformation import *
 
 
+def _is_lora_param(name):
+    """Check if parameter name corresponds to a LoRA parameter."""
+    return name.endswith('.lora_A') or name.endswith('.lora_B')
+
+
+def _is_omni_param(name, use_shift=True):
+    """Check if parameter name corresponds to an OmniQuant parameter."""
+    template = "smooth" if use_shift else "smooth_scale"
+    return name.find('bound_factor') > -1 or name.find(template) > -1 or _is_lora_param(name)
+
+
 def let_parameters(model, use_shift=True):
     params = []
     template = "smooth" if use_shift else "smooth_scale"
@@ -20,11 +31,18 @@ def lwc_parameters(model):
             params.append(m)
     return iter(params)  
 
+def lora_parameters(model):
+    """Get LoRA parameters (lora_A and lora_B) from the model."""
+    params = []
+    for n, m in model.named_parameters():
+        if _is_lora_param(n):
+            params.append(m)
+    return iter(params)
+
 def get_omni_parameters(model, use_shift=True):
     params = []
-    template = "smooth" if use_shift else "smooth_scale"
     for n, m in model.named_parameters():
-        if n.find('bound_factor') > -1 or n.find(template) > -1:
+        if _is_omni_param(n, use_shift):
             params.append(m)
     return iter(params)  
 
@@ -32,7 +50,7 @@ def omni_state_dict(model, destination=None, prefix='', keep_vars=False):
     if destination is None:
         destination = OrderedDict()
     for name, param in model.named_parameters():
-        if name.find('smooth') > -1 or name.find('bound_factor') > -1:
+        if name.find('smooth') > -1 or name.find('bound_factor') > -1 or _is_lora_param(name):
             destination[prefix + name] = param if keep_vars else param.detach()
     return destination
 

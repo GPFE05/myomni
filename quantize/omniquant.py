@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from models.int_llama_layer import QuantLlamaDecoderLayer
 from models.int_opt_layer import QuantOPTDecoderLayer
 from models.int_falcon_layer import QuantFalconDecoderLayer
@@ -11,9 +12,46 @@ import utils
 import os
 import pdb
 import gc
-from quantize.utils import let_parameters, lwc_parameters, get_omni_parameters,\
+from quantize.utils import let_parameters, lwc_parameters, lora_parameters, get_omni_parameters,\
                             omni_state_dict, register_scales_and_zeros,smooth_and_quant_temporary,\
                             smooth_and_quant_inplace,clear_temp_variable,set_quant_state
+
+
+class LoraLinear(nn.Module):
+    """
+    LoRA adapter wrapper for a linear layer.
+    Freezes the original weights and adds trainable low-rank matrices lora_A and lora_B.
+    Output = original_output + (x @ lora_A @ lora_B) * scaling
+    """
+    def __init__(self, org_module: nn.Linear, rank: int = 8, lora_alpha: float = 16.0):
+        super().__init__()
+        self.in_features = org_module.in_features
+        self.out_features = org_module.out_features
+        
+        # Keep original weights frozen
+        self.register_buffer('weight', org_module.weight.data.clone())
+        if org_module.bias is not None:
+            self.register_buffer('bias', org_module.bias.data.clone())
+        else:
+            self.bias = None
+        
+        # LoRA parameters (trainable)
+        self.lora_A = nn.Parameter(torch.zeros(self.in_features, rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, self.out_features))
+        self.scaling = lora_alpha / rank
+        
+        # Initialize lora_A with kaiming uniform and lora_B with zeros
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Original frozen linear output
+        base_out = F.linear(x, self.weight, self.bias)
+        # LoRA path: x @ lora_A @ lora_B * scaling
+        lora_out = (x @ self.lora_A @ self.lora_B) * self.scaling
+        return base_out + lora_out
+
+
 try:
     import auto_gptq.nn_modules.qlinear.qlinear_cuda as qlinear_cuda
     import auto_gptq.nn_modules.qlinear.qlinear_triton as qlinear_triton
@@ -194,11 +232,20 @@ def omniquant(
         layer = layers[i].to(dev)
         if "mixtral" in args.net.lower():  
             # for mixtral, we only leverage lwc, which can be achieve by simply replace Linear with QuantLinear
+            # For gate layers, we wrap them with LoraLinear instead of skipping them
             qlayer = copy.deepcopy(layer)
             for name, module in qlayer.named_modules():
-                if isinstance(module,torch.nn.Linear) and not "gate" in name:       # do not quantize gate
-                    quantlinear = QuantLinear(module, args.weight_quant_params, args.act_quant_params)
-                    add_new_module(name, qlayer, quantlinear)    
+                if isinstance(module, torch.nn.Linear):
+                    if "gate" in name:
+                        # Wrap gate (router) layers with LoraLinear
+                        lora_rank = getattr(args, 'lora_rank', 8)
+                        lora_alpha = getattr(args, 'lora_alpha', 16.0)
+                        lora_linear = LoraLinear(module, rank=lora_rank, lora_alpha=lora_alpha)
+                        add_new_module(name, qlayer, lora_linear)
+                    else:
+                        # Quantize non-gate linear layers
+                        quantlinear = QuantLinear(module, args.weight_quant_params, args.act_quant_params)
+                        add_new_module(name, qlayer, quantlinear)    
         else:
             qlayer = DecoderLayer(lm.model.config, layer, args)
         qlayer = qlayer.to(dev)
@@ -244,8 +291,16 @@ def omniquant(
             with torch.no_grad():
                 qlayer.float()      # required for AMP training
             # create optimizer
-            optimizer = torch.optim.AdamW(
-                [{"params":let_parameters(qlayer, use_shift),"lr":args.let_lr}, {"params":lwc_parameters(qlayer),"lr":args.lwc_lr}],weight_decay=args.wd)
+            param_groups = [
+                {"params": let_parameters(qlayer, use_shift), "lr": args.let_lr},
+                {"params": lwc_parameters(qlayer), "lr": args.lwc_lr}
+            ]
+            # Only add LoRA parameter group if there are LoRA parameters (Mixtral gate layers)
+            lora_params = list(lora_parameters(qlayer))
+            if lora_params:
+                lora_lr = getattr(args, 'lora_lr', args.let_lr)  # Default to let_lr if lora_lr not specified
+                param_groups.append({"params": lora_params, "lr": lora_lr})
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=args.wd)
             loss_scaler = utils.NativeScalerWithGradNormCount()
             
             for epochs in range(args.epochs):
