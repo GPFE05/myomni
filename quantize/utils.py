@@ -20,11 +20,19 @@ def lwc_parameters(model):
             params.append(m)
     return iter(params)  
 
+def lora_parameters(model):
+    """Get LoRA parameters (lora_A and lora_B) from the model."""
+    params = []
+    for n, m in model.named_parameters():
+        if n.find('lora_A') > -1 or n.find('lora_B') > -1:
+            params.append(m)
+    return iter(params)
+
 def get_omni_parameters(model, use_shift=True):
     params = []
     template = "smooth" if use_shift else "smooth_scale"
     for n, m in model.named_parameters():
-        if n.find('bound_factor') > -1 or n.find(template) > -1:
+        if n.find('bound_factor') > -1 or n.find(template) > -1 or n.find('lora_A') > -1 or n.find('lora_B') > -1:
             params.append(m)
     return iter(params)  
 
@@ -32,7 +40,7 @@ def omni_state_dict(model, destination=None, prefix='', keep_vars=False):
     if destination is None:
         destination = OrderedDict()
     for name, param in model.named_parameters():
-        if name.find('smooth') > -1 or name.find('bound_factor') > -1:
+        if name.find('smooth') > -1 or name.find('bound_factor') > -1 or name.find('lora_A') > -1 or name.find('lora_B') > -1:
             destination[prefix + name] = param if keep_vars else param.detach()
     return destination
 
