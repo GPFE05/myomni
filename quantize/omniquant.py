@@ -291,11 +291,16 @@ def omniquant(
             with torch.no_grad():
                 qlayer.float()      # required for AMP training
             # create optimizer
-            lora_lr = getattr(args, 'lora_lr', args.let_lr)  # Default to let_lr if lora_lr not specified
-            optimizer = torch.optim.AdamW(
-                [{"params":let_parameters(qlayer, use_shift),"lr":args.let_lr}, 
-                 {"params":lwc_parameters(qlayer),"lr":args.lwc_lr},
-                 {"params":lora_parameters(qlayer),"lr":lora_lr}],weight_decay=args.wd)
+            param_groups = [
+                {"params": let_parameters(qlayer, use_shift), "lr": args.let_lr},
+                {"params": lwc_parameters(qlayer), "lr": args.lwc_lr}
+            ]
+            # Only add LoRA parameter group if there are LoRA parameters (Mixtral gate layers)
+            lora_params = list(lora_parameters(qlayer))
+            if lora_params:
+                lora_lr = getattr(args, 'lora_lr', args.let_lr)  # Default to let_lr if lora_lr not specified
+                param_groups.append({"params": iter(lora_params), "lr": lora_lr})
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=args.wd)
             loss_scaler = utils.NativeScalerWithGradNormCount()
             
             for epochs in range(args.epochs):
