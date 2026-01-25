@@ -299,7 +299,7 @@ def omniquant(
             lora_params = list(lora_parameters(qlayer))
             if lora_params:
                 lora_lr = getattr(args, 'lora_lr', args.let_lr)  # Default to let_lr if lora_lr not specified
-                param_groups.append({"params": iter(lora_params), "lr": lora_lr})
+                param_groups.append({"params": lora_params, "lr": lora_lr})
             optimizer = torch.optim.AdamW(param_groups, weight_decay=args.wd)
             loss_scaler = utils.NativeScalerWithGradNormCount()
             

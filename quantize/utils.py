@@ -13,9 +13,7 @@ def _is_lora_param(name):
 def _is_omni_param(name, use_shift=True):
     """Check if parameter name corresponds to an OmniQuant parameter."""
     template = "smooth" if use_shift else "smooth_scale"
-    return (name.find('bound_factor') > -1 or 
-            name.find(template) > -1 or 
-            _is_lora_param(name))
+    return name.find('bound_factor') > -1 or name.find(template) > -1 or _is_lora_param(name)
 
 
 def let_parameters(model, use_shift=True):
