@@ -45,7 +45,8 @@ net_choices = [
     "llava-llama-2-13b-chat-lightning-preview",
     "falcon-180b",
     "falcon-7b",
-    "mixtral-8x7b"
+    "mixtral-8x7b",
+    "deepseek-moe-16b-base"
 ]
 
 
@@ -64,7 +65,7 @@ def evaluate(lm, args, logger):
             lm.model.model.decoder.final_layer_norm.to(output_device)
             lm.model.lm_head.to(output_device)
 
-        elif "llama" in args.net.lower() or "mixtral" in args.net.lower():
+        elif "llama" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower():
             map_layers_to_multi_gpus(lm.model.model.layers)
             input_device = lm.model.model.layers[0].device
             output_device = lm.model.model.layers[-1].device
@@ -85,7 +86,7 @@ def evaluate(lm, args, logger):
     else:
         if "opt" in args.net.lower():
             lm.model.model.decoder = lm.model.model.decoder.to(lm.device)
-        elif "llama" in args.net.lower() or "mixtral" in args.net.lower():
+        elif "llama" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower():
             lm.model = lm.model.to(lm.device)
         elif "falcon" in args.net.lower():
             lm.model.transformer = lm.model.transformer.to(lm.device)
@@ -120,7 +121,7 @@ def evaluate(lm, args, logger):
                 batch = testenc[:, (i * lm.seqlen) : ((i + 1) * lm.seqlen)].to(lm.device)
                 if "opt" in args.net.lower():
                     outputs = lm.model.model.decoder(batch)
-                elif "llama" in args.net.lower() or "mixtral" in args.net.lower():
+                elif "llama" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower():
                     outputs = lm.model.model(batch)
                 elif "falcon" in args.model:
                     outputs = lm.model.transformer(batch)
