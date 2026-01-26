@@ -95,8 +95,15 @@ def omniquant(
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
         layer_name_prefix = "model.layers"
+    elif 'qwen' in args.net.lower():
+        is_llama = True   # same to llama except ffn (MoE structure)
+        layers = model.model.layers
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
+        # Qwen2MoE only supports LWC quantization, no DecoderLayer needed
+        layer_name_prefix = "model.layers"
     else:
-        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen now")
     
     
     layers[0] = layers[0].to(dev)
@@ -141,7 +148,7 @@ def omniquant(
     # move embedding layer and first layer to cpu
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "llama" in args.net.lower() or "mixtral" in args.net.lower():
+    if "llama" in args.net.lower() or "mixtral" in args.net.lower() or "qwen" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
     elif "opt" in args.net.lower():
@@ -154,7 +161,7 @@ def omniquant(
     elif 'falcon' in args.model:
         model.transformer.word_embeddings =  model.transformer.word_embeddings.cpu()
     else:
-        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen now")
     torch.cuda.empty_cache()
 
     
@@ -192,11 +199,13 @@ def omniquant(
     for i in range(len(layers)):
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
-        if "mixtral" in args.net.lower():  
-            # for mixtral, we only leverage lwc, which can be achieve by simply replace Linear with QuantLinear
+        if "mixtral" in args.net.lower() or "qwen" in args.net.lower():  
+            # For MoE models (mixtral, qwen2moe), only LWC is supported
+            # Simply replace Linear with QuantLinear, do not quantize router (gate)
             qlayer = copy.deepcopy(layer)
             for name, module in qlayer.named_modules():
-                if isinstance(module,torch.nn.Linear) and not "gate" in name:       # do not quantize gate
+                # Skip gate (router) layers: mlp.gate, shared_expert_gate
+                if isinstance(module, torch.nn.Linear) and "gate" not in name:
                     quantlinear = QuantLinear(module, args.weight_quant_params, args.act_quant_params)
                     add_new_module(name, qlayer, quantlinear)    
         else:
