@@ -332,31 +332,49 @@ def omniquant(
             with torch.no_grad():
                 qlayer.float()      # required for AMP training
             # create optimizer with parameter groups
+            # LET/LWC parameters use weight_decay=0 (fixed, not controlled by args.wd)
             param_groups = [
-                {"params": let_parameters(qlayer, use_shift), "lr": args.let_lr},
-                {"params": lwc_parameters(qlayer), "lr": args.lwc_lr}
+                {"params": let_parameters(qlayer, use_shift), "lr": args.let_lr, "weight_decay": 0},
+                {"params": lwc_parameters(qlayer), "lr": args.lwc_lr, "weight_decay": 0}
             ]
             
-            # Add shared_expert_gate parameters if training is enabled
+            # Add shared_expert_gate parameters if training is enabled (uses args.wd)
             if train_shared_gate:
                 shared_gate_params = []
                 for name, module in qlayer.named_modules():
                     if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
                         shared_gate_params.extend([p for p in module.parameters() if p.requires_grad])
                 if shared_gate_params:
-                    param_groups.append({"params": shared_gate_params, "lr": shared_gate_lr})
+                    param_groups.append({"params": shared_gate_params, "lr": shared_gate_lr, "weight_decay": args.wd})
             
-            # Add LoRA parameters if training is enabled
+            # Add LoRA parameters if training is enabled (uses args.wd)
             if train_gate_lora:
                 lora_params = []
                 for name, module in qlayer.named_modules():
                     if isinstance(module, LoraLinear):
                         lora_params.extend([module.lora_A, module.lora_B])
                 if lora_params:
-                    param_groups.append({"params": lora_params, "lr": gate_lora_lr})
+                    param_groups.append({"params": lora_params, "lr": gate_lora_lr, "weight_decay": args.wd})
             
-            optimizer = torch.optim.AdamW(param_groups, weight_decay=args.wd)
+            # Default weight_decay=0 for optimizer (each group specifies its own)
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=0)
             loss_scaler = utils.NativeScalerWithGradNormCount()
+            
+            # Collect all trainable parameters for gradient clipping
+            # Start with quantization parameters (LET/LWC)
+            clip_parameters = list(get_omni_parameters(qlayer, use_shift))
+            
+            # Add shared_expert_gate parameters if training is enabled
+            if train_shared_gate:
+                for name, module in qlayer.named_modules():
+                    if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
+                        clip_parameters.extend([p for p in module.parameters() if p.requires_grad])
+            
+            # Add LoRA parameters if training is enabled
+            if train_gate_lora:
+                for name, module in qlayer.named_modules():
+                    if isinstance(module, LoraLinear):
+                        clip_parameters.extend([module.lora_A, module.lora_B])
             
             # Log training configuration once per block (first layer only)
             if i == 0:
@@ -385,7 +403,8 @@ def omniquant(
                         
                     loss_list.append(loss.detach().cpu())
                     optimizer.zero_grad()
-                    norm = loss_scaler(loss, optimizer,parameters= get_omni_parameters(qlayer, use_shift)).cpu()
+                    # Use complete parameter list for gradient clipping
+                    norm = loss_scaler(loss, optimizer, parameters=clip_parameters).cpu()
                     norm_list.append(norm.data)
 
                 loss_mean = torch.stack(loss_list).mean()
