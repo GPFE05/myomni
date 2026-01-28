@@ -21,7 +21,7 @@ class LoraLinear(nn.Module):
     LoRA wrapper for nn.Linear layer.
     Freezes the original weight and trains low-rank adapters lora_A and lora_B.
     """
-    def __init__(self, linear: nn.Linear, r: int = 8, alpha: float = 16):
+    def __init__(self, linear: nn.Linear, r: int = 8, alpha: float = 16, seed: int = 42):
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
@@ -36,8 +36,11 @@ class LoraLinear(nn.Module):
         else:
             self.register_parameter('bias', None)
         
-        # Initialize LoRA matrices: A with Gaussian, B with zeros
-        self.lora_A = nn.Parameter(torch.randn(r, self.in_features, device=linear.weight.device, dtype=linear.weight.dtype) * 0.01)
+        # Initialize LoRA matrices with fixed seed for reproducibility
+        # A with Gaussian (scaled), B with zeros
+        generator = torch.Generator(device=linear.weight.device)
+        generator.manual_seed(seed)
+        self.lora_A = nn.Parameter(torch.randn(r, self.in_features, device=linear.weight.device, dtype=linear.weight.dtype, generator=generator) * 0.01)
         self.lora_B = nn.Parameter(torch.zeros(self.out_features, r, device=linear.weight.device, dtype=linear.weight.dtype))
     
     def forward(self, x):
@@ -275,8 +278,8 @@ def omniquant(
                         # else: skip, keep as frozen nn.Linear (default behavior)
                     elif is_router_gate:
                         if train_gate_lora:
-                            # Replace with LoraLinear wrapper
-                            lora_linear = LoraLinear(module, r=lora_r, alpha=lora_alpha)
+                            # Replace with LoraLinear wrapper (use layer index as seed for reproducibility)
+                            lora_linear = LoraLinear(module, r=lora_r, alpha=lora_alpha, seed=args.seed + i)
                             add_new_module(name, qlayer, lora_linear)
                         # else: skip, keep as frozen nn.Linear (default behavior)
                     else:
