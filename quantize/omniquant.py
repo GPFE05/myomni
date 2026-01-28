@@ -243,7 +243,7 @@ def omniquant(
 
 
     if args.resume:
-        omni_parameters = torch.load(args.resume)
+        omni_parameters = torch.load(args.resume, weights_only=False)
     else:
         omni_parameters = {}
 
@@ -256,6 +256,7 @@ def omniquant(
             # For MoE models (mixtral, qwen2moe), only LWC is supported
             # Simply replace Linear with QuantLinear, do not quantize router (gate)
             qlayer = copy.deepcopy(layer)
+            
             for name, module in qlayer.named_modules():
                 if isinstance(module, torch.nn.Linear):
                     # Target 1: Shared Expert Gate - name ends with "shared_expert_gate"
@@ -354,6 +355,15 @@ def omniquant(
             optimizer = torch.optim.AdamW(param_groups, weight_decay=args.wd)
             loss_scaler = utils.NativeScalerWithGradNormCount()
             
+            # Log training configuration once per block (first layer only)
+            if i == 0:
+                if train_shared_gate:
+                    logger.info(f"[Gate Training] shared_expert_gate training ENABLED with lr={shared_gate_lr}")
+                if train_gate_lora:
+                    logger.info(f"[Gate Training] router gate LoRA training ENABLED with r={lora_r}, alpha={lora_alpha}, lr={gate_lora_lr}")
+                if not train_shared_gate and not train_gate_lora:
+                    logger.info("[Gate Training] All gate training DISABLED (default behavior)")
+            
             for epochs in range(args.epochs):
                 loss_list = []
                 norm_list = []
@@ -377,7 +387,30 @@ def omniquant(
 
                 loss_mean = torch.stack(loss_list).mean()
                 norm_mean = torch.stack(norm_list).mean()
-                logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
+                
+                # Calculate and log gate training gradient norms
+                gate_grad_info = ""
+                if train_shared_gate:
+                    shared_gate_grad_norm = 0.0
+                    for name, module in qlayer.named_modules():
+                        if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
+                            if module.weight.grad is not None:
+                                shared_gate_grad_norm += module.weight.grad.norm().item() ** 2
+                    shared_gate_grad_norm = shared_gate_grad_norm ** 0.5
+                    gate_grad_info += f" shared_gate_grad:{shared_gate_grad_norm:.2e}"
+                
+                if train_gate_lora:
+                    lora_grad_norm = 0.0
+                    for name, module in qlayer.named_modules():
+                        if isinstance(module, LoraLinear):
+                            if module.lora_A.grad is not None:
+                                lora_grad_norm += module.lora_A.grad.norm().item() ** 2
+                            if module.lora_B.grad is not None:
+                                lora_grad_norm += module.lora_B.grad.norm().item() ** 2
+                    lora_grad_norm = lora_grad_norm ** 0.5
+                    gate_grad_info += f" lora_grad:{lora_grad_norm:.2e}"
+                
+                logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean}{gate_grad_info} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
             clear_temp_variable(qlayer)
             del optimizer
             
