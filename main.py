@@ -234,6 +234,12 @@ def main():
     parser.add_argument("--net", type=str, default=None, choices=net_choices)
     parser.add_argument("--act-scales", type=str, default=None)
     parser.add_argument("--act-shifts", type=str, default=None)
+    parser.add_argument("--train_shared_gate", default=False, action="store_true", help="Train shared_expert_gate layers during calibration (for Qwen2-MoE)")
+    parser.add_argument("--train_gate_lora", default=False, action="store_true", help="Apply LoRA to mlp.gate (router) layers and train them (for MoE models)")
+    parser.add_argument("--shared_gate_lr", type=float, default=1e-4, help="Learning rate for shared_expert_gate training")
+    parser.add_argument("--gate_lora_lr", type=float, default=1e-4, help="Learning rate for LoRA gate training")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank for gate training")
+    parser.add_argument("--lora_alpha", type=float, default=16, help="LoRA alpha (scaling factor) for gate training")
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -351,6 +357,12 @@ def main():
             act_scales,
             act_shifts,
             logger,
+            train_shared_gate=args.train_shared_gate,
+            train_gate_lora=args.train_gate_lora,
+            shared_gate_lr=args.shared_gate_lr,
+            gate_lora_lr=args.gate_lora_lr,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
         )
         logger.info(time.time() - tick)
     if args.save_dir:

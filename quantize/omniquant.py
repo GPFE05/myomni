@@ -14,6 +14,53 @@ import gc
 from quantize.utils import let_parameters, lwc_parameters, get_omni_parameters,\
                             omni_state_dict, register_scales_and_zeros,smooth_and_quant_temporary,\
                             smooth_and_quant_inplace,clear_temp_variable,set_quant_state
+
+
+class LoraLinear(nn.Module):
+    """
+    LoRA wrapper for nn.Linear layer.
+    Freezes the original weight and trains low-rank adapters lora_A and lora_B.
+    """
+    def __init__(self, linear: nn.Linear, r: int = 8, alpha: float = 16):
+        super().__init__()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+        
+        # Copy original weight and bias, freeze them
+        self.weight = nn.Parameter(linear.weight.data.clone(), requires_grad=False)
+        if linear.bias is not None:
+            self.bias = nn.Parameter(linear.bias.data.clone(), requires_grad=False)
+        else:
+            self.register_parameter('bias', None)
+        
+        # Initialize LoRA matrices: A with Gaussian, B with zeros
+        self.lora_A = nn.Parameter(torch.randn(r, self.in_features, device=linear.weight.device, dtype=linear.weight.dtype) * 0.01)
+        self.lora_B = nn.Parameter(torch.zeros(self.out_features, r, device=linear.weight.device, dtype=linear.weight.dtype))
+    
+    def forward(self, x):
+        # output = x @ (W + scaling * B @ A).T + bias
+        # = x @ W.T + scaling * x @ A.T @ B.T + bias
+        base_out = nn.functional.linear(x, self.weight, self.bias)
+        lora_out = nn.functional.linear(nn.functional.linear(x, self.lora_A), self.lora_B)
+        return base_out + self.scaling * lora_out
+    
+    def merge(self):
+        """
+        Merge LoRA weights into the original weight and return a standard nn.Linear.
+        """
+        # Merge: W_new = W + scaling * B @ A
+        merged_weight = self.weight.data + self.scaling * (self.lora_B.data @ self.lora_A.data)
+        
+        linear = nn.Linear(self.in_features, self.out_features, bias=self.bias is not None, 
+                          device=merged_weight.device, dtype=merged_weight.dtype)
+        linear.weight.data = merged_weight
+        if self.bias is not None:
+            linear.bias.data = self.bias.data.clone()
+        
+        return linear
 try:
     import auto_gptq.nn_modules.qlinear.qlinear_cuda as qlinear_cuda
     import auto_gptq.nn_modules.qlinear.qlinear_triton as qlinear_triton
@@ -46,6 +93,12 @@ def omniquant(
     act_scales,
     act_shifts,
     logger=None,
+    train_shared_gate=False,
+    train_gate_lora=False,
+    shared_gate_lr=1e-4,
+    gate_lora_lr=1e-4,
+    lora_r=8,
+    lora_alpha=16,
 ):
     logger.info("Starting ...")
     
@@ -204,10 +257,32 @@ def omniquant(
             # Simply replace Linear with QuantLinear, do not quantize router (gate)
             qlayer = copy.deepcopy(layer)
             for name, module in qlayer.named_modules():
-                # Skip gate (router) layers: mlp.gate, shared_expert_gate
-                if isinstance(module, torch.nn.Linear) and "gate" not in name:
-                    quantlinear = QuantLinear(module, args.weight_quant_params, args.act_quant_params)
-                    add_new_module(name, qlayer, quantlinear)    
+                if isinstance(module, torch.nn.Linear):
+                    # Target 1: Shared Expert Gate - name ends with "shared_expert_gate"
+                    is_shared_expert_gate = name.endswith("shared_expert_gate")
+                    
+                    # Target 2: Router Gate - name ends with ".gate" (NOT "gate_proj")
+                    # e.g., "mlp.gate" is router, but "mlp.experts.0.gate_proj" is NOT
+                    is_router_gate = name.endswith(".gate") or name == "gate"
+                    
+                    if is_shared_expert_gate:
+                        if train_shared_gate:
+                            # Keep as nn.Linear but make trainable
+                            module.weight.requires_grad = True
+                            if module.bias is not None:
+                                module.bias.requires_grad = True
+                        # else: skip, keep as frozen nn.Linear (default behavior)
+                    elif is_router_gate:
+                        if train_gate_lora:
+                            # Replace with LoraLinear wrapper
+                            lora_linear = LoraLinear(module, r=lora_r, alpha=lora_alpha)
+                            add_new_module(name, qlayer, lora_linear)
+                        # else: skip, keep as frozen nn.Linear (default behavior)
+                    else:
+                        # Target 3: All other linear layers (including gate_proj)
+                        # Replace with QuantLinear
+                        quantlinear = QuantLinear(module, args.weight_quant_params, args.act_quant_params)
+                        add_new_module(name, qlayer, quantlinear)    
         else:
             qlayer = DecoderLayer(lm.model.config, layer, args)
         qlayer = qlayer.to(dev)
@@ -252,9 +327,31 @@ def omniquant(
         if args.epochs > 0:
             with torch.no_grad():
                 qlayer.float()      # required for AMP training
-            # create optimizer
-            optimizer = torch.optim.AdamW(
-                [{"params":let_parameters(qlayer, use_shift),"lr":args.let_lr}, {"params":lwc_parameters(qlayer),"lr":args.lwc_lr}],weight_decay=args.wd)
+            # create optimizer with parameter groups
+            param_groups = [
+                {"params": let_parameters(qlayer, use_shift), "lr": args.let_lr},
+                {"params": lwc_parameters(qlayer), "lr": args.lwc_lr}
+            ]
+            
+            # Add shared_expert_gate parameters if training is enabled
+            if train_shared_gate:
+                shared_gate_params = []
+                for name, module in qlayer.named_modules():
+                    if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
+                        shared_gate_params.extend([p for p in module.parameters() if p.requires_grad])
+                if shared_gate_params:
+                    param_groups.append({"params": shared_gate_params, "lr": shared_gate_lr})
+            
+            # Add LoRA parameters if training is enabled
+            if train_gate_lora:
+                lora_params = []
+                for name, module in qlayer.named_modules():
+                    if isinstance(module, LoraLinear):
+                        lora_params.extend([module.lora_A, module.lora_B])
+                if lora_params:
+                    param_groups.append({"params": lora_params, "lr": gate_lora_lr})
+            
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=args.wd)
             loss_scaler = utils.NativeScalerWithGradNormCount()
             
             for epochs in range(args.epochs):
@@ -283,6 +380,15 @@ def omniquant(
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
             clear_temp_variable(qlayer)
             del optimizer
+            
+            # Merge LoRA weights back into original Linear layers after training
+            if train_gate_lora:
+                for name, module in list(qlayer.named_modules()):
+                    if isinstance(module, LoraLinear):
+                        merged_linear = module.merge()
+                        add_new_module(name, qlayer, merged_linear)
+                        logger.info(f"Merged LoRA weights for {name}")
+        
         qlayer.half() 
         # real smooth and quantization
         smooth_and_quant_inplace(qlayer, args, is_llama)
