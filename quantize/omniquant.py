@@ -105,6 +105,16 @@ def omniquant(
 ):
     logger.info("Starting ...")
     
+    # WandB integration: import and initialize global step for continuous training curve
+    wandb = None
+    if getattr(args, 'enable_wandb', False):
+        try:
+            import wandb as _wandb
+            wandb = _wandb
+        except ImportError:
+            logger.warning("WandB not installed but enable_wandb=True. Skipping WandB logging.")
+    global_step = 0  # Global step counter for continuous WandB logging across layers
+    
     # move embedding layer and first layer to target device
     model = lm.model
     dev = lm.device
@@ -412,8 +422,10 @@ def omniquant(
                 
                 # Calculate and log gate training gradient norms
                 gate_grad_info = ""
+                shared_gate_grad_norm = 0.0
+                lora_grad_norm = 0.0
+                
                 if train_shared_gate:
-                    shared_gate_grad_norm = 0.0
                     for name, module in qlayer.named_modules():
                         if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
                             if module.weight.grad is not None:
@@ -422,7 +434,6 @@ def omniquant(
                     gate_grad_info += f" shared_gate_grad:{shared_gate_grad_norm:.2e}"
                 
                 if train_gate_lora:
-                    lora_grad_norm = 0.0
                     for name, module in qlayer.named_modules():
                         if isinstance(module, LoraLinear):
                             if module.lora_A.grad is not None:
@@ -433,6 +444,53 @@ def omniquant(
                     gate_grad_info += f" lora_grad:{lora_grad_norm:.2e}"
                 
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean}{gate_grad_info} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
+                
+                # WandB logging: Log metrics with strict naming schema for Router Collapse detection
+                if wandb is not None:
+                    # Extract learning rates from optimizer param_groups
+                    lr_shared_gate = None
+                    lr_router_lora = None
+                    for pg in optimizer.param_groups:
+                        # Identify groups by checking if they contain shared_gate or lora params
+                        if len(pg['params']) > 0:
+                            # Check if this is the shared gate group (3rd group, index 2)
+                            if train_shared_gate and lr_shared_gate is None:
+                                for name, module in qlayer.named_modules():
+                                    if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
+                                        for p in module.parameters():
+                                            if p.requires_grad and any(p is pp for pp in pg['params']):
+                                                lr_shared_gate = pg['lr']
+                                                break
+                            # Check if this is the lora group (4th group, index 3)
+                            if train_gate_lora and lr_router_lora is None:
+                                for name, module in qlayer.named_modules():
+                                    if isinstance(module, LoraLinear):
+                                        if any(module.lora_A is pp or module.lora_B is pp for pp in pg['params']):
+                                            lr_router_lora = pg['lr']
+                                            break
+                    
+                    # Build metrics dict with strict naming schema
+                    wandb_metrics = {
+                        "train/loss": loss_mean.item(),
+                        "train/layer_id": i,
+                        "train/epoch": epochs,
+                        "train/grad_norm_mean": norm_mean.item(),
+                    }
+                    
+                    # Add gradient norms for Router Collapse detection
+                    if train_shared_gate:
+                        wandb_metrics["grad/shared_expert_norm"] = shared_gate_grad_norm
+                    if train_gate_lora:
+                        wandb_metrics["grad/router_lora_norm"] = lora_grad_norm
+                    
+                    # Add learning rates for hyperparameter tracking
+                    if lr_shared_gate is not None:
+                        wandb_metrics["lr/shared_gate"] = lr_shared_gate
+                    if lr_router_lora is not None:
+                        wandb_metrics["lr/router_lora"] = lr_router_lora
+                    
+                    wandb.log(wandb_metrics, step=global_step)
+                    global_step += 1
             clear_temp_variable(qlayer)
             del optimizer
             

@@ -240,6 +240,11 @@ def main():
     parser.add_argument("--gate_lora_lr", type=float, default=1e-4, help="Learning rate for LoRA gate training")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank for gate training")
     parser.add_argument("--lora_alpha", type=float, default=16, help="LoRA alpha (scaling factor) for gate training")
+    
+    # WandB arguments for training visualization
+    parser.add_argument("--enable_wandb", action="store_true", help="Enable Weights & Biases logging for training visualization")
+    parser.add_argument("--wandb_project", type=str, default="omniquant-moe", help="WandB project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name (optional)")
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -264,6 +269,20 @@ def main():
     output_dir = Path(args.output_dir)
     logger = utils.create_logger(output_dir)
     logger.info(args)
+    
+    # Initialize WandB if enabled
+    if args.enable_wandb:
+        try:
+            import wandb
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config=vars(args)  # Pass all args for hyperparameter analysis (Parallel Coordinates Plot)
+            )
+            logger.info(f"WandB initialized: project={args.wandb_project}, run={args.wandb_run_name or 'auto'}")
+        except ImportError:
+            logger.warning("WandB not installed. Disabling WandB logging. Install with: pip install wandb")
+            args.enable_wandb = False
     
     # load model
     if args.net is None:
