@@ -15,6 +15,8 @@ from tqdm import tqdm
 import utils
 from pathlib import Path
 from categories import subcategories, categories
+from accelerate import dispatch_model, infer_auto_device_map
+from accelerate.utils import get_balanced_memory
 
 from models.int_llama_layer import QuantLlamaDecoderLayer
 from models.int_opt_layer import QuantOPTDecoderLayer
@@ -22,8 +24,19 @@ from quantize.int_linear import QuantLinear
 
 import pdb
 
-
 torch.backends.cudnn.benchmark = True
+
+
+def get_max_memory_map(ratio=0.95):
+    if ratio <= 0 or ratio > 1:
+        raise ValueError("ratio must be in (0, 1]")
+    max_memory = {}
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            total_memory = torch.cuda.get_device_properties(i).total_memory
+            max_memory[i] = int(total_memory * ratio)
+    return max_memory
+
 
 net_choices = [
     "opt-125m",
@@ -54,7 +67,13 @@ net_choices = [
 @torch.no_grad()
 def evaluate(lm, args, logger):
     results = {}
+
+    # === 1. GPU / 并行策略 ===
+    if getattr(args, 'parallelize', False) and args.multigpu:
+        raise ValueError("Cannot use both --parallelize and --multigpu")
+
     if args.multigpu:
+        # 手动多卡映射逻辑 (保持不变)
         if "opt" in args.net.lower():
             map_layers_to_multi_gpus(lm.model.model.decoder.layers)
             input_device = lm.model.model.decoder.layers[0].device
@@ -65,8 +84,7 @@ def evaluate(lm, args, logger):
             lm.model.model.decoder.embed_tokens.to(input_device)
             lm.model.model.decoder.final_layer_norm.to(output_device)
             lm.model.lm_head.to(output_device)
-
-        elif "llama" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower() or "qwen" in args.net.lower():
+        elif "llama" in args.net.lower() or "vicuna" in args.net.lower() or "mixtral" in args.net.lower() or "qwen" in args.net.lower() or "deepseek" in args.net.lower():
             map_layers_to_multi_gpus(lm.model.model.layers)
             input_device = lm.model.model.layers[0].device
             output_device = lm.model.model.layers[-1].device
@@ -84,21 +102,44 @@ def evaluate(lm, args, logger):
             lm.model.transformer.word_embeddings.to(input_device)
             lm.model.transformer.ln_f.to(output_device)
             lm.model.lm_head.to(output_device)
+
+    elif getattr(args, 'parallelize', False):
+        # === 回答问题4：防止切分关键层 ===
+        # Qwen2MoeDecoderLayer 是 Qwen1.5-MoE 在 HF transformers 中的标准名称
+        # 加上它，accelerate 就会保证这一层完整地放在同一张卡上
+        no_split = ["LlamaDecoderLayer", "QuantLlamaDecoderLayer", "Qwen2MoeDecoderLayer", "MixtralDecoderLayer"]
+
+        balanced_mem = get_balanced_memory(
+            lm.model,
+            max_memory=get_max_memory_map(0.95),
+            no_split_module_classes=no_split
+        )
+        logger.info(f"Auto-balancing memory: {balanced_mem}")
+        device_map = infer_auto_device_map(
+            lm.model,
+            max_memory=balanced_mem,
+            no_split_module_classes=no_split
+        )
+        lm.model = dispatch_model(lm.model, device_map=device_map)
+
     else:
+        # 单卡逻辑
         if "opt" in args.net.lower():
             lm.model.model.decoder = lm.model.model.decoder.to(lm.device)
-        elif "llama" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower() or "qwen" in args.net.lower():
+        elif "llama" in args.net.lower() or "vicuna" in args.net.lower() or "qwen" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower():
             lm.model = lm.model.to(lm.device)
         elif "falcon" in args.net.lower():
             lm.model.transformer = lm.model.transformer.to(lm.device)
 
-
+    # === 2. PPL 评测 (计算但不保存CSV) ===
     if args.eval_ppl:
-        # for dataset in ["wikitext2", "ptb", "c4","ptb-new",'c4-new']:
-        for dataset in ["wikitext2", "c4"]:
-            cache_testloader = f'{args.cache_dir}/testloader_{args.model_family}_{dataset}_all.cache'
+        logger.info(f"model seqlen is {lm.seqlen}")
+        datasets = args.test_datasets.split(",") if hasattr(args, 'test_datasets') else ["wikitext2", "c4"]
+
+        for dataset in datasets:
+            cache_testloader = f'{args.cache_dir}/testloader_{args.net}_{dataset}_all.cache'
             if os.path.exists(cache_testloader):
-                testloader = torch.load(cache_testloader, weights_only=False)
+                testloader = torch.load(cache_testloader)
                 logger.info(f"load calibration from {cache_testloader}")
             else:
                 dataloader, testloader = get_loaders(
@@ -118,20 +159,29 @@ def evaluate(lm, args, logger):
             lm.model.config.use_cache = False
             lm.model.eval()
             nlls = []
-            for i in tqdm(range(nsamples)):
-                batch = testenc[:, (i * lm.seqlen) : ((i + 1) * lm.seqlen)].to(lm.device)
+
+            output_hidden_states = False if getattr(args, 'save_hidden_states_dir', None) is None else True
+
+            for i in tqdm(range(nsamples), desc=f"Eval PPL {dataset}"):
+                batch = testenc[:, (i * lm.seqlen): ((i + 1) * lm.seqlen)].to(lm.device)
+
+                # Forward pass logic
                 if "opt" in args.net.lower():
-                    outputs = lm.model.model.decoder(batch)
-                elif "llama" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower() or "qwen" in args.net.lower():
-                    outputs = lm.model.model(batch)
+                    outputs = lm.model.model.decoder(batch, output_hidden_states=output_hidden_states)
+                elif "llama" in args.net.lower() or "vicuna" in args.net.lower() or "qwen" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower():
+                    outputs = lm.model.model(batch, output_hidden_states=output_hidden_states)
                 elif "falcon" in args.model:
-                    outputs = lm.model.transformer(batch)
+                    outputs = lm.model.transformer(batch, output_hidden_states=output_hidden_states)
                 hidden_states = outputs[0]
+
+                if hasattr(lm.model.lm_head, "bias") and lm.model.lm_head.bias is not None:
+                    lm.model.lm_head.bias = torch.nn.Parameter(lm.model.lm_head.bias.to(lm.model.lm_head.weight.device))
+
                 logits = lm.model.lm_head(hidden_states)
                 shift_logits = logits[:, :-1, :]
-                shift_labels = testenc[:, (i * lm.seqlen) : ((i + 1) * lm.seqlen)][
-                    :, 1:
-                ].to(lm.model.lm_head.weight.device)
+                shift_labels = testenc[:, (i * lm.seqlen): ((i + 1) * lm.seqlen)][:, 1:].to(
+                    lm.model.lm_head.weight.device)
+
                 loss_fct = nn.CrossEntropyLoss()
                 loss = loss_fct(
                     shift_logits.view(-1, shift_logits.size(-1)),
@@ -143,47 +193,104 @@ def evaluate(lm, args, logger):
                     break
 
             ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * lm.seqlen))
-            logger.info(f'{dataset} : {ppl.item()}')
+            logger.info(f'{dataset} perplexity: {ppl.item()}')
             lm.model.config.use_cache = use_cache
             results[dataset] = ppl.item()
+
+    # === 3. 下游任务评测 (LM Eval) & CSV 保存 ===
     if args.tasks != "":
-        t_results = evaluator.simple_evaluate(
-            lm,
-            tasks=args.tasks,
-            num_fewshot=args.num_fewshot,
-            limit=None if args.limit == -1 else args.limit,
-        )
-        results.update(t_results)
-        logger.info(results)
-        pprint(results)
-        # for test of MMLU
-        if 'hendrycksTest' in args.tasks:
-            all_cors = []
-            all_cors_norm = []
-            subcat_cors = {subcat: [] for subcat_lists in subcategories.values() for subcat in subcat_lists}
-            cat_cors = {cat: [] for cat in categories}
-            cat_cors_norm = {cat: [] for cat in categories}
-            for key in t_results['results'].keys():
-                if not 'hendrycksTest' in key:
-                    continue
-                subject = key.split('-')[-1]
-                cors = t_results['results'][key]['acc']
-                cors_norm = t_results['results'][key]['acc_norm']
-                subcats = subcategories[subject]
-                for subcat in subcats:
-                    subcat_cors[subcat].append(cors)
-                    for key in categories.keys():
-                        if subcat in categories[key]:
-                            cat_cors[key].append(cors)
-                            cat_cors_norm[key].append(cors_norm)
-                    all_cors.append(cors)
-                    all_cors_norm.append(cors_norm)
-                    
-            for cat in cat_cors:
-                cat_acc = np.mean(cat_cors[cat])
-                logger.info("Average accuracy {:.4f} - {}".format(cat_acc, cat))
-            weighted_acc = np.mean(all_cors)
-            logger.info("Average accuracy: {:.4f}".format(weighted_acc))               
+        task_list = args.tasks.split(",") if isinstance(args.tasks, str) else args.tasks
+
+        import lm_eval
+        from lm_eval.models.huggingface import HFLM
+
+        try:
+            task_manager = lm_eval.tasks.TaskManager(include_path="./datasets_local/lm_eval_configs/tasks",
+                                                     include_defaults=True)
+        except Exception:
+            task_manager = lm_eval.tasks.TaskManager(include_defaults=True)
+
+        # === 回答问题2：处理 batch size ===
+        # 优先使用 lm_eval_batch_size，如果不存在或为None，则使用 'auto'
+        # HFLM 支持 batch_size='auto' (自动寻找最大batch size)
+        eval_batch_size = getattr(args, 'lm_eval_batch_size', 'auto')
+        if eval_batch_size is None:
+            eval_batch_size = 'auto'
+
+        print(f"Initializing HFLM with batch_size={eval_batch_size}...")
+
+        hflm = HFLM(pretrained=lm.model, tokenizer=lm.tokenizer, batch_size=eval_batch_size)
+
+        t_results = lm_eval.simple_evaluate(
+            model=hflm,
+            tasks=task_list,
+            batch_size=eval_batch_size,
+            task_manager=task_manager,
+            gen_kwargs=args.gen_kwargs,
+        )['results']
+
+        metric_vals = {}
+        for task, result in t_results.items():
+            metric_vals[task] = round(result.get('acc_norm,none', result.get('acc,none', 0)), 4)
+
+        logger.info(f"Task Results: {metric_vals}")
+        pprint(metric_vals)
+        results.update(metric_vals)
+
+        # === 4. CSV 保存逻辑 (仅在跑了 Task 时触发) ===
+        # 过滤 metric_vals，只保留需要写入 CSV 的数据
+        reported_metric_vals = {}
+        for k, v in metric_vals.items():
+            if "mmlu" in k:
+                if k == "mmlu":
+                    reported_metric_vals[k] = v
+            else:
+                reported_metric_vals[k] = v
+
+        import pandas as pd
+        csv_path = f"{args.output_dir}/results.csv"
+
+        if os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            new_df = pd.DataFrame(reported_metric_vals, index=[0])
+            # 补齐列
+            for col in new_df.columns:
+                if col not in df.columns:
+                    df[col] = None
+            df = pd.concat([df, new_df], ignore_index=True)
+        else:
+            df = pd.DataFrame(reported_metric_vals, index=[0])
+
+        # 计算 Average 指标
+        if len(task_list) >= 5:
+            cols = ['piqa', 'arc_easy', 'arc_challenge', 'hellaswag', 'winogrande']
+            if all(c in df.columns for c in cols):
+                df["avg-5"] = df[cols].mean(axis=1)
+        if len(task_list) >= 6:
+            cols = ['piqa', 'arc_easy', 'arc_challenge', 'hellaswag', 'winogrande', 'boolq']
+            if all(c in df.columns for c in cols):
+                df["avg-6"] = df[cols].mean(axis=1)
+
+        logger.info(f"Saving task results to {csv_path}...")
+        logger.info(df)
+        df.to_csv(csv_path, index=False)
+
+    model = lm.model
+    if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "qwen" in args.net.lower():
+        model.model.embed_tokens = model.model.embed_tokens.cpu()
+        model.model.norm = model.model.norm.cpu()
+    elif "opt" in args.net.lower():
+        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
+        model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
+        if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out:
+            model.model.decoder.project_out = model.model.decoder.project_out.cpu()
+        if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
+            model.model.decoder.project_in = model.model.decoder.project_in.cpu()
+    elif 'falcon' in args.model:
+        model.transformer.word_embeddings = model.transformer.word_embeddings.cpu()
+    else:
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
+
     return results
 
 
@@ -192,21 +299,32 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, help="model name of model path")
-    parser.add_argument("--cache_dir", default="./cache", type=str, help="cache dir of dataset, leading to faster debug")
+    parser.add_argument("--cache_dir", default="./cache", type=str,
+                        help="cache dir of dataset, leading to faster debug")
     parser.add_argument("--output_dir", default="../log/", type=str, help="direction of logging file")
     parser.add_argument("--save_dir", default=None, type=str, help="direction for saving fake quantization model")
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--real_quant", default=False, action="store_true", help="real quantization, which can see memory reduce. Note that due to the limitations of AutoGPTQ kernels, the real quantization of weight-only quantization can only lead memory reduction, but with slower inference speed.")
-    parser.add_argument("--calib_dataset",type=str,default="wikitext2",
-        choices=["wikitext2", "ptb", "c4", "mix","pile"],
-        help="Where to extract calibration data from.",
-    )
+    parser.add_argument("--real_quant", default=False, action="store_true",
+                        help="real quantization, which can see memory reduce. Note that due to the limitations of AutoGPTQ kernels, the real quantization of weight-only quantization can only lead memory reduction, but with slower inference speed.")
+    parser.add_argument("--calib_dataset", type=str, default="wikitext2",
+                        choices=["wikitext2", "ptb", "c4", "mix", "pile"],
+                        help="Where to extract calibration data from.",
+                        )
     parser.add_argument("--nsamples", type=int, default=128, help="Number of calibration data samples.")
     parser.add_argument("--batch_size", type=int, default=1, help="batch size.")
     parser.add_argument("--seed", type=int, default=2, help="Seed for sampling the calibration data.")
     parser.add_argument("--tasks", default="")
     parser.add_argument("--eval_ppl", action="store_true")
     parser.add_argument("--num_fewshot", type=int, default=0)
+    parser.add_argument(
+        "--gen_kwargs",
+        type=str,
+        default=None,
+        help=(
+            "Generation kwargs for lm-eval generate_until tasks, e.g. "
+            "temperature=0.6,top_p=0.95,top_k=20,min_p=0,do_sample=True"
+        ),
+    )
     parser.add_argument("--wbits", type=int, default=4)
     parser.add_argument("--abits", type=int, default=16)
     parser.add_argument("--group_size", type=int, default=None)
@@ -215,15 +333,25 @@ def main():
     parser.add_argument("--lwc_lr", type=float, default=1e-2)
     parser.add_argument("--wd", type=float, default=0)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--let",default=False, action="store_true",help="activate learnable equivalent transformation")
-    parser.add_argument("--lwc",default=False, action="store_true",help="activate learnable weight clipping")
-    parser.add_argument("--aug_loss", default=False, action="store_true", help="calculate additional loss with same input")
-    parser.add_argument("--symmetric",default=False, action="store_true", help="symmetric quantization")
-    parser.add_argument("--disable_zero_point",default=False, action="store_true", help="quantization without zero_point")
+    parser.add_argument("--let", default=False, action="store_true",
+                        help="activate learnable equivalent transformation")
+    parser.add_argument("--lwc", default=False, action="store_true", help="activate learnable weight clipping")
+    parser.add_argument("--aug_loss", default=False, action="store_true",
+                        help="calculate additional loss with same input")
+    parser.add_argument("--symmetric", default=False, action="store_true", help="symmetric quantization")
+    parser.add_argument("--disable_zero_point", default=False, action="store_true",
+                        help="quantization without zero_point")
     parser.add_argument("--a_dynamic_method", type=str, default="per_token", choices=["per_token"])
     parser.add_argument("--w_dynamic_method", type=str, default="per_channel", choices=["per_channel"])
     parser.add_argument("--limit", type=int, default=-1)
     parser.add_argument("--multigpu", action="store_true", help="at eval, map model to multiple gpus")
+    parser.add_argument("--lm_eval_batch_size", type=str, default="auto",
+                        help="Batch size for lm-eval tasks. Can be an integer or 'auto'.")
+    parser.add_argument("--enable_wandb", action="store_true", help="enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="omniquant", help="Weights & Biases project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name")
+    parser.add_argument("--parallelize", action="store_true",
+                        help="auto device_map with Accelerate; incompatible with --multigpu")
     parser.add_argument("--deactive_amp", action="store_true", help="deactivate AMP when 8<=bits<16")
     parser.add_argument(
         "--attn_implementation",
@@ -234,17 +362,15 @@ def main():
     parser.add_argument("--net", type=str, default=None, choices=net_choices)
     parser.add_argument("--act-scales", type=str, default=None)
     parser.add_argument("--act-shifts", type=str, default=None)
-    parser.add_argument("--train_shared_gate", default=False, action="store_true", help="Train shared_expert_gate layers during calibration (for Qwen2-MoE)")
-    parser.add_argument("--train_gate_lora", default=False, action="store_true", help="Apply LoRA to mlp.gate (router) layers and train them (for MoE models)")
-    parser.add_argument("--shared_gate_lr", type=float, default=1e-4, help="Learning rate for shared_expert_gate training")
+    parser.add_argument("--train_shared_gate", default=False, action="store_true",
+                        help="Train shared_expert_gate layers during calibration (for Qwen2-MoE)")
+    parser.add_argument("--train_gate_lora", default=False, action="store_true",
+                        help="Apply LoRA to mlp.gate (router) layers and train them (for MoE models)")
+    parser.add_argument("--shared_gate_lr", type=float, default=1e-4,
+                        help="Learning rate for shared_expert_gate training")
     parser.add_argument("--gate_lora_lr", type=float, default=1e-4, help="Learning rate for LoRA gate training")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank for gate training")
     parser.add_argument("--lora_alpha", type=float, default=16, help="LoRA alpha (scaling factor) for gate training")
-    
-    # WandB arguments for training visualization
-    parser.add_argument("--enable_wandb", action="store_true", help="Enable Weights & Biases logging for training visualization")
-    parser.add_argument("--wandb_project", type=str, default="omniquant-moe", help="WandB project name")
-    parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name (optional)")
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -255,8 +381,8 @@ def main():
     # check
     if args.epochs > 0:
         assert args.lwc or args.let
-        
-    if (args.wbits<16 and args.wbits>=8) or (args.abits<16 and args.abits>=8):
+
+    if (args.wbits < 16 and args.wbits >= 8) or (args.abits < 16 and args.abits >= 8):
         args.deactive_amp = True
 
     # init logger
@@ -269,21 +395,18 @@ def main():
     output_dir = Path(args.output_dir)
     logger = utils.create_logger(output_dir)
     logger.info(args)
-    
-    # Initialize WandB if enabled
+
     if args.enable_wandb:
         try:
             import wandb
             wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
-                config=vars(args)  # Pass all args for hyperparameter analysis (Parallel Coordinates Plot)
+                config=vars(args),
             )
-            logger.info(f"WandB initialized: project={args.wandb_project}, run={args.wandb_run_name or 'auto'}")
         except ImportError:
-            logger.warning("WandB not installed. Disabling WandB logging. Install with: pip install wandb")
-            args.enable_wandb = False
-    
+            logger.warning("WandB not installed but enable_wandb=True. Skipping WandB logging.")
+
     # load model
     if args.net is None:
         args.net = args.model.split('/')[-1]
@@ -295,19 +418,17 @@ def main():
     for param in lm.model.parameters():
         param.requires_grad = False
 
-    
-
     args.weight_quant_params = {
         "n_bits": args.wbits,
         "per_channel_axes": [0],
         "symmetric": args.symmetric,
         "dynamic_method": args.w_dynamic_method,
         "group_size": args.group_size,
-        "lwc":args.lwc,
+        "lwc": args.lwc,
         "disable_zero_point": args.disable_zero_point
     }
     args.act_quant_params = {
-        "n_bits":  args.abits,
+        "n_bits": args.abits,
         "per_channel_axes": [],
         "symmetric": False,
         "dynamic_method": args.a_dynamic_method,
@@ -347,9 +468,9 @@ def main():
         args.act_shifts = f'./act_shifts/{args.net}.pt'
 
     # quantization
-    if args.wbits < 16 or args.abits <16:
+    if args.wbits < 16 or args.abits < 16:
         logger.info("=== start quantization ===")
-        tick = time.time()     
+        tick = time.time()
         # load calibration dataset
         cache_dataloader = f'{args.cache_dir}/dataloader_{args.model_family}_{args.calib_dataset}_{args.nsamples}.cache'
         if os.path.exists(cache_dataloader):
@@ -363,7 +484,7 @@ def main():
                 model=args.model,
                 seqlen=lm.seqlen,
             )
-            torch.save(dataloader, cache_dataloader)    
+            torch.save(dataloader, cache_dataloader)
         act_scales = None
         act_shifts = None
         if args.let:
@@ -390,17 +511,17 @@ def main():
             if isinstance(module, QuantLinear):
                 del module.weight_quantizer.lowbound_factor
                 del module.weight_quantizer.upbound_factor
-            if isinstance(module,QuantLlamaDecoderLayer) or isinstance(module,QuantOPTDecoderLayer):
+            if isinstance(module, QuantLlamaDecoderLayer) or isinstance(module, QuantOPTDecoderLayer):
                 if args.let:
                     del module.qkv_smooth_scale
                     del module.qkv_smooth_shift
                     del module.out_smooth_scale
                     del module.out_smooth_shift
                     del module.fc1_smooth_scale
-                    del module.fc1_smooth_shift           
-        lm.model.save_pretrained(args.save_dir)  
-        lm.tokenizer.save_pretrained(args.save_dir) 
-    evaluate(lm, args,logger)
+                    del module.fc1_smooth_shift
+        lm.model.save_pretrained(args.save_dir)
+        lm.tokenizer.save_pretrained(args.save_dir)
+    evaluate(lm, args, logger)
 
 
 if __name__ == "__main__":
