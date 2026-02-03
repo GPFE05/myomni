@@ -133,13 +133,11 @@ def evaluate(lm, args, logger):
 
     # === 2. PPL 评测 (计算但不保存CSV) ===
     if args.eval_ppl:
-        logger.info(f"model seqlen is {lm.seqlen}")
-        datasets = args.test_datasets.split(",") if hasattr(args, 'test_datasets') else ["wikitext2", "c4"]
-
-        for dataset in datasets:
-            cache_testloader = f'{args.cache_dir}/testloader_{args.net}_{dataset}_all.cache'
+        # for dataset in ["wikitext2", "ptb", "c4","ptb-new",'c4-new']:
+        for dataset in ["wikitext2", "c4"]:
+            cache_testloader = f'{args.cache_dir}/testloader_{args.model_family}_{dataset}_all.cache'
             if os.path.exists(cache_testloader):
-                testloader = torch.load(cache_testloader)
+                testloader = torch.load(cache_testloader, weights_only=False)
                 logger.info(f"load calibration from {cache_testloader}")
             else:
                 dataloader, testloader = get_loaders(
@@ -159,29 +157,20 @@ def evaluate(lm, args, logger):
             lm.model.config.use_cache = False
             lm.model.eval()
             nlls = []
-
-            output_hidden_states = False if getattr(args, 'save_hidden_states_dir', None) is None else True
-
-            for i in tqdm(range(nsamples), desc=f"Eval PPL {dataset}"):
-                batch = testenc[:, (i * lm.seqlen): ((i + 1) * lm.seqlen)].to(lm.device)
-
-                # Forward pass logic
+            for i in tqdm(range(nsamples)):
+                batch = testenc[:, (i * lm.seqlen) : ((i + 1) * lm.seqlen)].to(lm.device)
                 if "opt" in args.net.lower():
-                    outputs = lm.model.model.decoder(batch, output_hidden_states=output_hidden_states)
-                elif "llama" in args.net.lower() or "vicuna" in args.net.lower() or "qwen" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower():
-                    outputs = lm.model.model(batch, output_hidden_states=output_hidden_states)
+                    outputs = lm.model.model.decoder(batch)
+                elif "llama" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower() or "qwen" in args.net.lower():
+                    outputs = lm.model.model(batch)
                 elif "falcon" in args.model:
-                    outputs = lm.model.transformer(batch, output_hidden_states=output_hidden_states)
+                    outputs = lm.model.transformer(batch)
                 hidden_states = outputs[0]
-
-                if hasattr(lm.model.lm_head, "bias") and lm.model.lm_head.bias is not None:
-                    lm.model.lm_head.bias = torch.nn.Parameter(lm.model.lm_head.bias.to(lm.model.lm_head.weight.device))
-
                 logits = lm.model.lm_head(hidden_states)
                 shift_logits = logits[:, :-1, :]
-                shift_labels = testenc[:, (i * lm.seqlen): ((i + 1) * lm.seqlen)][:, 1:].to(
-                    lm.model.lm_head.weight.device)
-
+                shift_labels = testenc[:, (i * lm.seqlen) : ((i + 1) * lm.seqlen)][
+                    :, 1:
+                ].to(lm.model.lm_head.weight.device)
                 loss_fct = nn.CrossEntropyLoss()
                 loss = loss_fct(
                     shift_logits.view(-1, shift_logits.size(-1)),
@@ -193,7 +182,7 @@ def evaluate(lm, args, logger):
                     break
 
             ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * lm.seqlen))
-            logger.info(f'{dataset} perplexity: {ppl.item()}')
+            logger.info(f'{dataset} : {ppl.item()}')
             lm.model.config.use_cache = use_cache
             results[dataset] = ppl.item()
 
