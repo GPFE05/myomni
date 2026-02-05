@@ -329,6 +329,13 @@ def omniquant(
         if is_qwen_moe and calibrate_router:
             logger.info(f"[Router Calibration] Layer {i}: Starting router calibration...")
             
+            # Convert qlayer to FP32 for stable router calibration (same as LWC training)
+            # This is required because:
+            # 1. V100 doesn't support BF16, and autocast converts to FP16 which can cause precision issues
+            # 2. GradScaler doesn't support FP16 gradients
+            # 3. LWC training also uses qlayer.float() before training
+            qlayer.float()
+            
             # ============================================================
             # Phase A: Capture FP16 router labels from ORIGINAL layer
             # ============================================================
@@ -434,10 +441,9 @@ def omniquant(
                 
                 if router_gate_params:
                     logger.info(f"[Router Calibration] Layer {i}: {len(router_gate_params)} unique parameters to optimize")
-                    router_optimizer = torch.optim.AdamW(router_gate_params, lr=router_lr, weight_decay=0)
                     
-                    # Use GradScaler for mixed precision training to avoid gradient underflow/overflow
-                    grad_scaler = torch.amp.GradScaler('cuda')
+                    # qlayer is already FP32 (converted at start of router calibration)
+                    router_optimizer = torch.optim.AdamW(router_gate_params, lr=router_lr, weight_decay=0)
                     
                     # Setup hook once for all training iterations using simple closure
                     hook_fn, get_logits, clear_logits = create_router_hook()
@@ -450,51 +456,46 @@ def omniquant(
                             router_optimizer.zero_grad()
                             clear_logits()
                             
-                            # Forward and capture router logits via hook
-                            # Use autocast for both forward and loss computation for consistency
+                            # Forward pass - qlayer is FP32, use autocast for efficiency
                             with torch.amp.autocast('cuda'):
                                 _ = qlayer(
                                     quant_inps[j].unsqueeze(0),
                                     attention_mask=attention_mask,
                                     position_ids=position_ids
                                 )
-                                router_logits = get_logits()
-                                
-                                if router_logits is not None:
-                                    if router_logits.dim() == 2:
-                                        router_logits = router_logits.unsqueeze(0)
-                                    
-                                    if teacher_indices.dim() == 2:
-                                        teacher_prob_sample = teacher_probs[j*seqlen:(j+1)*seqlen].unsqueeze(0)
-                                        teacher_idx_sample = teacher_indices[j*seqlen:(j+1)*seqlen].unsqueeze(0)
-                                    else:
-                                        teacher_prob_sample = teacher_probs[j:j+1]
-                                        teacher_idx_sample = teacher_indices[j:j+1]
-                                    
-                                    # Convert logits to float32 for stable loss computation
-                                    loss = compute_topk_mse_loss(
-                                        router_logits.float(),
-                                        teacher_prob_sample,
-                                        teacher_idx_sample,
-                                        debug=(j == 0 and epoch == 0)
-                                    )
+                            router_logits = get_logits()
                             
-                            if router_logits is not None and not (torch.isnan(loss) or torch.isinf(loss)):
-                                # Use GradScaler for proper mixed precision backward
-                                grad_scaler.scale(loss).backward()
+                            if router_logits is not None:
+                                if router_logits.dim() == 2:
+                                    router_logits = router_logits.unsqueeze(0)
                                 
-                                # Unscale gradients and clip to prevent explosion
-                                grad_scaler.unscale_(router_optimizer)
-                                torch.nn.utils.clip_grad_norm_(router_gate_params, max_norm=1.0)
+                                if teacher_indices.dim() == 2:
+                                    teacher_prob_sample = teacher_probs[j*seqlen:(j+1)*seqlen].unsqueeze(0)
+                                    teacher_idx_sample = teacher_indices[j*seqlen:(j+1)*seqlen].unsqueeze(0)
+                                else:
+                                    teacher_prob_sample = teacher_probs[j:j+1]
+                                    teacher_idx_sample = teacher_indices[j:j+1]
                                 
-                                # Check for NaN gradients before stepping
-                                has_nan_grad = any(p.grad is not None and torch.isnan(p.grad).any() for p in router_gate_params)
-                                if not has_nan_grad:
-                                    grad_scaler.step(router_optimizer)
-                                    epoch_loss += loss.item()
-                                    valid_samples += 1
+                                # Compute loss in FP32 for numerical stability
+                                loss = compute_topk_mse_loss(
+                                    router_logits.float(),
+                                    teacher_prob_sample,
+                                    teacher_idx_sample,
+                                    debug=(j == 0 and epoch == 0)
+                                )
                                 
-                                grad_scaler.update()
+                                if not (torch.isnan(loss) or torch.isinf(loss)):
+                                    loss.backward()
+                                    
+                                    # Clip gradients to prevent explosion
+                                    torch.nn.utils.clip_grad_norm_(router_gate_params, max_norm=1.0)
+                                    
+                                    # Check for NaN gradients before stepping
+                                    has_nan_grad = any(p.grad is not None and torch.isnan(p.grad).any() for p in router_gate_params)
+                                    if not has_nan_grad:
+                                        router_optimizer.step()
+                                        epoch_loss += loss.item()
+                                        valid_samples += 1
                         
                         avg_loss = epoch_loss / max(valid_samples, 1)
                         logger.info(f"[Router Calibration] Layer {i} Epoch {epoch}: TopK-MSE Loss = {avg_loss:.6f} ({valid_samples}/{args.nsamples} valid)")
