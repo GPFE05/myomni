@@ -457,7 +457,9 @@ def omniquant(
                             clear_logits()
                             
                             # Forward pass - qlayer is FP32, use autocast for efficiency
+                            # Must call smooth_and_quant_temporary each iteration to recreate computation graph
                             with torch.amp.autocast('cuda'):
+                                smooth_and_quant_temporary(qlayer, args, is_llama)
                                 _ = qlayer(
                                     quant_inps[j].unsqueeze(0),
                                     attention_mask=attention_mask,
