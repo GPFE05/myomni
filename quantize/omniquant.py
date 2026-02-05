@@ -425,19 +425,35 @@ def omniquant(
                     param.requires_grad = False
                 
                 # Enable gradient only for router gate (directly on qlayer, not wrapped)
+                # Support both nn.Linear and LoraLinear (when train_gate_lora is enabled)
                 router_gate_params = []
                 seen_params = set()
+                router_gate_module = None
                 for name, module in qlayer.named_modules():
-                    if name.endswith("mlp.gate") and isinstance(module, nn.Linear):
-                        if id(module.weight) not in seen_params:
-                            module.weight.requires_grad = True
-                            router_gate_params.append(module.weight)
-                            seen_params.add(id(module.weight))
-                            if module.bias is not None and id(module.bias) not in seen_params:
-                                module.bias.requires_grad = True
-                                router_gate_params.append(module.bias)
-                                seen_params.add(id(module.bias))
-                            logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name}")
+                    if name.endswith("mlp.gate"):
+                        router_gate_module = module
+                        if isinstance(module, LoraLinear):
+                            # For LoraLinear: train the original weight only, not LoRA matrices
+                            # Temporarily enable gradient for the frozen weight
+                            if id(module.weight) not in seen_params:
+                                module.weight.requires_grad = True
+                                router_gate_params.append(module.weight)
+                                seen_params.add(id(module.weight))
+                                if module.bias is not None and id(module.bias) not in seen_params:
+                                    module.bias.requires_grad = True
+                                    router_gate_params.append(module.bias)
+                                    seen_params.add(id(module.bias))
+                                logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name} (LoraLinear.weight)")
+                        elif isinstance(module, nn.Linear):
+                            if id(module.weight) not in seen_params:
+                                module.weight.requires_grad = True
+                                router_gate_params.append(module.weight)
+                                seen_params.add(id(module.weight))
+                                if module.bias is not None and id(module.bias) not in seen_params:
+                                    module.bias.requires_grad = True
+                                    router_gate_params.append(module.bias)
+                                    seen_params.add(id(module.bias))
+                                logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name} (nn.Linear)")
                 
                 if router_gate_params:
                     logger.info(f"[Router Calibration] Layer {i}: {len(router_gate_params)} unique parameters to optimize")

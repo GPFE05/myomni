@@ -390,8 +390,8 @@ def main():
     # Router Calibration arguments (for Qwen2-MoE)
     parser.add_argument("--calibrate_router", default=False, action="store_true",
                         help="Enable Router Calibration using TopK-MSE loss for Qwen2-MoE")
-    parser.add_argument("--router_lr", type=float, default=1e-3,
-                        help="Learning rate for router calibration")
+    parser.add_argument("--router_lr", type=float, default=1e-2,
+                        help="Learning rate for router calibration (default 1e-2, higher than LWC)")
     parser.add_argument("--router_epochs", type=int, default=5,
                         help="Number of epochs for router calibration per layer")
     parser.add_argument("--k_loss", type=int, default=20,
