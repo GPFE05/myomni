@@ -16,8 +16,8 @@ from quantize.utils import (
     let_parameters, lwc_parameters, get_omni_parameters,
     omni_state_dict, register_scales_and_zeros, smooth_and_quant_temporary,
     smooth_and_quant_inplace, clear_temp_variable, set_quant_state,
-    capture_router_labels_layerwise, compute_expert_shift, compute_expert_shift_detailed,
-    compute_topk_mse_loss, wrap_qwen2moe_layer_for_router_output, unwrap_qwen2moe_layer
+    capture_router_labels_layerwise, compute_expert_shift_detailed,
+    compute_topk_mse_loss, forward_with_router_logits, create_router_hook
 )
 
 
@@ -351,18 +351,13 @@ def omniquant(
                 # This ensures we measure the impact of quantization on router
                 set_quant_state(qlayer, weight_quant=False, act_quant=True)
                 
-                # Wrap qlayer for router logits output
-                wrapped_qlayer = wrap_qwen2moe_layer_for_router_output(qlayer)
-                wrapped_qlayer = wrapped_qlayer.to(dev)
-                
                 # Helper function to compute expert shift with temporary quantization
-                def compute_shift_metrics(layer_to_eval, inner_layer, inputs, teacher_idx, num_samples=8, desc="", apply_quant=False):
+                def compute_shift_metrics(layer, inputs, teacher_idx, num_samples=8, desc="", apply_quant=False):
                     """
-                    Compute expert shift metrics.
+                    Compute expert shift metrics using hook mechanism.
                     
                     Args:
-                        layer_to_eval: Wrapped layer that can output router_logits
-                        inner_layer: Inner layer for applying temporary quantization
+                        layer: Layer to evaluate (directly, no wrapper needed)
                         inputs: Input tensor
                         teacher_idx: Teacher expert indices
                         num_samples: Number of samples to evaluate
@@ -375,18 +370,19 @@ def omniquant(
                     for j in range(min(num_samples, inputs.shape[0])):
                         # Apply temporary weight quantization if requested
                         if apply_quant:
-                            smooth_and_quant_temporary(inner_layer, args, is_llama)
+                            smooth_and_quant_temporary(layer, args, is_llama)
                         
-                        out, router_logits = layer_to_eval(
+                        # Use hook-based forward to get router logits
+                        out, router_logits = forward_with_router_logits(
+                            layer,
                             inputs[j].unsqueeze(0),
                             attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            output_router_logits=True
+                            position_ids=position_ids
                         )
                         
                         # Clear temporary quantization
                         if apply_quant:
-                            clear_temp_variable(inner_layer)
+                            clear_temp_variable(layer)
                         
                         if router_logits is not None:
                             if router_logits.dim() == 2:
@@ -407,13 +403,10 @@ def omniquant(
                     n = min(num_samples, inputs.shape[0])
                     return shift_any_sum / n, shift_half_sum / n, shift_all_sum / n
                 
-                # Get inner layer for temporary quantization
-                inner_qlayer = unwrap_qwen2moe_layer(wrapped_qlayer)
-                
                 # Compute Pre-Calibration Expert Shift (with temporary weight quantization)
                 with torch.no_grad():
                     pre_shift_any, pre_shift_half, pre_shift_all = compute_shift_metrics(
-                        wrapped_qlayer, inner_qlayer, quant_inps, teacher_indices, 
+                        qlayer, quant_inps, teacher_indices, 
                         num_samples=8, desc="Pre-Calib", apply_quant=True
                     )
                     logger.info(f"[Router Calibration] Layer {i}: Pre-Calib Expert Shift (Quantized vs FP) - Any: {pre_shift_any:.4f}, Half: {pre_shift_half:.4f}, All: {pre_shift_all:.4f}")
@@ -448,19 +441,24 @@ def omniquant(
                     logger.info(f"[Router Calibration] Layer {i}: {len(router_gate_params)} unique parameters to optimize")
                     router_optimizer = torch.optim.AdamW(router_gate_params, lr=router_lr, weight_decay=0)
                     
+                    # Setup hook once for all training iterations using simple closure
+                    hook_fn, get_logits, clear_logits = create_router_hook()
+                    hook_handle = qlayer.mlp.gate.register_forward_hook(hook_fn)
+                    
                     for epoch in range(router_epochs):
                         epoch_loss = 0.0
                         valid_samples = 0
                         for j in range(args.nsamples):
                             router_optimizer.zero_grad()
+                            clear_logits()
                             
-                            # Forward with router logits
-                            _, router_logits = wrapped_qlayer(
+                            # Forward and capture router logits via hook
+                            _ = qlayer(
                                 quant_inps[j].unsqueeze(0),
                                 attention_mask=attention_mask,
-                                position_ids=position_ids,
-                                output_router_logits=True
+                                position_ids=position_ids
                             )
+                            router_logits = get_logits()
                             
                             if router_logits is not None:
                                 if router_logits.dim() == 2:
@@ -499,6 +497,7 @@ def omniquant(
                             }, step=global_step)
                             global_step += 1
                     
+                    hook_handle.remove()
                     del router_optimizer
                 
                 # Restore requires_grad states
@@ -511,7 +510,7 @@ def omniquant(
                 # ============================================================
                 with torch.no_grad():
                     post_shift_any, post_shift_half, post_shift_all = compute_shift_metrics(
-                        wrapped_qlayer, inner_qlayer, quant_inps, teacher_indices, 
+                        qlayer, quant_inps, teacher_indices, 
                         num_samples=8, desc="", apply_quant=True
                     )
                     logger.info(f"[Router Calibration] Layer {i}: Post-Calib Expert Shift - Any: {post_shift_any:.4f}, Half: {post_shift_half:.4f}, All: {post_shift_all:.4f}")
@@ -536,11 +535,9 @@ def omniquant(
                 logger.info(f"[Router Calibration] Layer {i}: Router calibration complete. Continuing to LWC training...")
             else:
                 logger.warning(f"[Router Calibration] Layer {i}: No router gate found, skipping calibration.")
-                wrapped_qlayer = None
                 router_calib_pre_shift = None
                 router_calib_post_shift = None
         else:
-            wrapped_qlayer = None
             router_calib_pre_shift = None
             router_calib_post_shift = None
         
@@ -751,11 +748,6 @@ def omniquant(
             teacher_probs, teacher_indices = cached_router_labels
             seqlen = fp_inps.shape[1]
             
-            # Wrap again for final check if needed
-            wrapped_qlayer = wrap_qwen2moe_layer_for_router_output(qlayer)
-            wrapped_qlayer = wrapped_qlayer.to(dev)
-            inner_qlayer_final = unwrap_qwen2moe_layer(wrapped_qlayer)
-            
             with torch.no_grad():
                 final_shift_any_sum = 0.0
                 final_shift_half_sum = 0.0
@@ -763,17 +755,18 @@ def omniquant(
                 num_samples = min(args.nsamples, 8)
                 for j in range(num_samples):
                     # Apply temporary weight quantization
-                    smooth_and_quant_temporary(inner_qlayer_final, args, is_llama)
+                    smooth_and_quant_temporary(qlayer, args, is_llama)
                     
-                    out, router_logits = wrapped_qlayer(
+                    # Use hook-based forward to get router logits
+                    out, router_logits = forward_with_router_logits(
+                        qlayer,
                         quant_inps[j].unsqueeze(0),
                         attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        output_router_logits=True
+                        position_ids=position_ids
                     )
                     
                     # Clear temporary quantization
-                    clear_temp_variable(inner_qlayer_final)
+                    clear_temp_variable(qlayer)
                     
                     if router_logits is not None:
                         # Reshape router_logits if needed
@@ -814,9 +807,6 @@ def omniquant(
                         "router_calib/final_shift_all": final_shift_all,
                         "router_calib/layer_id": i,
                     }, step=global_step)
-            
-            # Unwrap back to original qlayer
-            qlayer = unwrap_qwen2moe_layer(wrapped_qlayer)
         
         qlayer.half() 
         # real smooth and quantization

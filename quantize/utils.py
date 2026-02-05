@@ -78,50 +78,6 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
 # =============================================================================
 # Task 2: Expert Shift Metrics
 # =============================================================================
-def compute_expert_shift(student_logits, teacher_indices, k_routing):
-    """
-    Compute the mismatch rate between student and teacher expert selections.
-    
-    Args:
-        student_logits: Router logits from student model [batch, seq_len, num_experts]
-        teacher_indices: Top-k expert indices from teacher [batch, seq_len, topk_cached]
-        k_routing: Number of experts actually used for routing (may be <= topk_cached)
-    
-    Returns:
-        mismatch_rate: Float value representing percentage of tokens where at least one expert changed
-    """
-    num_experts = student_logits.shape[-1]
-    
-    # Get student's top-k selections
-    student_probs = torch.softmax(student_logits, dim=-1)
-    _, student_indices = torch.topk(student_probs, k=k_routing, dim=-1)  # [batch, seq, k_routing]
-    
-    # Take only top k_routing from teacher indices
-    teacher_topk = teacher_indices[..., :k_routing]  # [batch, seq, k_routing]
-    
-    # Use one-hot encoding for proper SET intersection
-    # This correctly counts how many experts are in BOTH sets
-    batch_size, seq_len = student_logits.shape[:2]
-    
-    # Create one-hot masks [batch, seq, num_experts]
-    student_onehot = torch.zeros(batch_size, seq_len, num_experts, device=student_logits.device)
-    student_onehot.scatter_(-1, student_indices, 1)
-    
-    teacher_onehot = torch.zeros(batch_size, seq_len, num_experts, device=student_logits.device)
-    teacher_onehot.scatter_(-1, teacher_topk, 1)
-    
-    # Count intersection: experts selected by BOTH student and teacher
-    matches_per_token = (student_onehot * teacher_onehot).sum(dim=-1)  # [batch, seq]
-    
-    # A token is "matched" if all k_routing experts are the same
-    match = (matches_per_token == k_routing)  # [batch, seq]
-    
-    # Compute mismatch rate (at least one expert changed)
-    mismatch_rate = 1.0 - match.float().mean().item()
-    
-    return mismatch_rate
-
-
 def compute_expert_shift_detailed(student_logits, teacher_indices, k_routing, debug=False):
     """
     Compute detailed expert shift metrics based on three levels of change.
@@ -191,135 +147,79 @@ def compute_expert_shift_detailed(student_logits, teacher_indices, k_routing, de
 
 
 # =============================================================================
-# Task 3: Quantized Qwen2-MoE Decoder Layer Wrapper
+# Task 3: Router Logits Capture via Simple Hook
 # =============================================================================
-class QuantQwen2MoeDecoderLayer(nn.Module):
+def forward_with_router_logits(layer, hidden_states, attention_mask=None, position_ids=None, **kwargs):
     """
-    Wrapper for Qwen2MoeDecoderLayer that supports outputting router logits.
-    This preserves backward compatibility while enabling router calibration.
-    
-    NOTE: We do NOT override named_modules/named_parameters/modules to avoid
-    duplicate parameter issues. The wrapper is transparent - external code should
-    access the inner layer directly via .layer attribute when needed.
-    """
-    
-    def __init__(self, original_layer, args=None):
-        super().__init__()
-        # Use _layer to avoid conflicts with nn.Module's attribute handling
-        self._inner_layer = original_layer
-        self.args = args
-        
-        # Store reference to the router gate for easy access
-        self._router_logits = None
-        self._hook_handle = None
-        
-        # Track if we need to capture router logits
-        self._capture_router_logits = False
-    
-    @property
-    def layer(self):
-        """Access the inner layer."""
-        return self._inner_layer
-    
-    def _setup_router_hook(self):
-        """Setup hook to capture router logits during forward pass."""
-        if self._hook_handle is not None:
-            return
-        
-        if hasattr(self._inner_layer, 'mlp') and hasattr(self._inner_layer.mlp, 'gate'):
-            def hook_fn(module, input, output):
-                # Keep gradient history by not detaching
-                self._router_logits = output
-            self._hook_handle = self._inner_layer.mlp.gate.register_forward_hook(hook_fn)
-    
-    def _remove_router_hook(self):
-        """Remove the router hook."""
-        if self._hook_handle is not None:
-            self._hook_handle.remove()
-            self._hook_handle = None
-    
-    def forward(self, hidden_states, attention_mask=None, position_ids=None, 
-                output_router_logits=False, **kwargs):
-        """
-        Forward pass with optional router logits output.
-        
-        Args:
-            hidden_states: Input tensor
-            attention_mask: Attention mask
-            position_ids: Position IDs
-            output_router_logits: If True, return (hidden_states, router_logits)
-            **kwargs: Additional arguments passed to the layer
-        
-        Returns:
-            If output_router_logits=False: hidden_states (or tuple from original layer)
-            If output_router_logits=True: (hidden_states, router_logits)
-        """
-        self._router_logits = None
-        
-        if output_router_logits:
-            self._setup_router_hook()
-        
-        # Call the original layer
-        outputs = self._inner_layer(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            **kwargs
-        )
-        
-        # Extract hidden states from outputs
-        if isinstance(outputs, tuple):
-            hidden_states_out = outputs[0]
-        else:
-            hidden_states_out = outputs
-        
-        if output_router_logits:
-            self._remove_router_hook()
-            router_logits = self._router_logits
-            self._router_logits = None
-            return (hidden_states_out, router_logits)
-        
-        return outputs
-    
-    def __getattr__(self, name):
-        """Delegate attribute access to the wrapped layer."""
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self._inner_layer, name)
-
-
-def wrap_qwen2moe_layer_for_router_output(qlayer):
-    """
-    Wrap a Qwen2MoE layer to support router logits output.
-    This is a non-invasive wrapper that preserves the original layer structure.
+    Forward pass through a layer while capturing router logits via hook.
     
     Args:
-        qlayer: The quantized layer (with QuantLinear modules)
+        layer: The decoder layer (can be quantized or original)
+        hidden_states: Input tensor
+        attention_mask: Attention mask
+        position_ids: Position IDs
+        **kwargs: Additional arguments
     
     Returns:
-        Wrapped layer that supports output_router_logits argument
+        (hidden_states_out, router_logits): Tuple of output hidden states and router logits
     """
-    # Check if already wrapped
-    if isinstance(qlayer, QuantQwen2MoeDecoderLayer):
-        return qlayer
+    captured = {}
     
-    return QuantQwen2MoeDecoderLayer(qlayer)
+    def hook_fn(module, input, output):
+        captured['logits'] = output  # Keep gradient history by not detaching
+    
+    # Register hook
+    handle = None
+    if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate'):
+        handle = layer.mlp.gate.register_forward_hook(hook_fn)
+    
+    # Forward
+    outputs = layer(
+        hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        **kwargs
+    )
+    
+    # Remove hook
+    if handle is not None:
+        handle.remove()
+    
+    # Extract hidden states
+    if isinstance(outputs, tuple):
+        hidden_states_out = outputs[0]
+    else:
+        hidden_states_out = outputs
+    
+    return hidden_states_out, captured.get('logits', None)
 
 
-def unwrap_qwen2moe_layer(wrapped_layer):
+def create_router_hook():
     """
-    Unwrap a QuantQwen2MoeDecoderLayer to get the original layer.
-    
-    Args:
-        wrapped_layer: Possibly wrapped layer
+    Create a simple router logits hook using closure.
     
     Returns:
-        The inner layer if wrapped, otherwise the input layer itself
+        (hook_fn, get_logits_fn): A tuple of hook function and getter function
+    
+    Usage:
+        hook_fn, get_logits = create_router_hook()
+        handle = layer.mlp.gate.register_forward_hook(hook_fn)
+        _ = layer(input, ...)
+        router_logits = get_logits()
+        handle.remove()
     """
-    if isinstance(wrapped_layer, QuantQwen2MoeDecoderLayer):
-        return wrapped_layer._inner_layer
-    return wrapped_layer
+    captured = {}
+    
+    def hook_fn(module, input, output):
+        captured['logits'] = output
+    
+    def get_logits():
+        return captured.get('logits', None)
+    
+    def clear():
+        captured.clear()
+    
+    return hook_fn, get_logits, clear
 
 
 # =============================================================================
