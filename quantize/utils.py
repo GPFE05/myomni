@@ -354,6 +354,7 @@ def smooth_and_quant_temporary(model, args, isllama):
 def clear_temp_variable(model):
     for name, module in model.named_modules():
         if isinstance(module, QuantLinear):
+            module.use_temporary_parameter = False  # Must reset this flag!
             if hasattr(module, "temp_weight"):
                 del module.temp_weight
             if hasattr(module, "temp_bias"):
