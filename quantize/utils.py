@@ -48,7 +48,7 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
     
     for j in range(nsamples):
         captured_data.clear()
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             _ = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)
         if captured_data:
             values, indices = captured_data[0]

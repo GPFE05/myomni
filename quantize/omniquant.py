@@ -189,7 +189,7 @@ def omniquant(
         traincast = nullcontext
     else:
         dtype = torch.float16
-        traincast = torch.cuda.amp.autocast
+        traincast = lambda: torch.amp.autocast('cuda')
     inps = torch.zeros(
         (args.nsamples, lm.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
@@ -368,7 +368,7 @@ def omniquant(
                     for j in range(min(num_samples, inputs.shape[0])):
                         # Use hook-based forward to get router logits
                         # Use autocast to handle dtype mismatch (input FP16, weights FP32)
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast('cuda'):
                             out, router_logits = forward_with_router_logits(
                                 layer,
                                 inputs[j].unsqueeze(0),
@@ -436,6 +436,9 @@ def omniquant(
                     logger.info(f"[Router Calibration] Layer {i}: {len(router_gate_params)} unique parameters to optimize")
                     router_optimizer = torch.optim.AdamW(router_gate_params, lr=router_lr, weight_decay=0)
                     
+                    # Use GradScaler for mixed precision training to avoid gradient underflow/overflow
+                    grad_scaler = torch.amp.GradScaler('cuda')
+                    
                     # Setup hook once for all training iterations using simple closure
                     hook_fn, get_logits, clear_logits = create_router_hook()
                     hook_handle = qlayer.mlp.gate.register_forward_hook(hook_fn)
@@ -448,40 +451,50 @@ def omniquant(
                             clear_logits()
                             
                             # Forward and capture router logits via hook
-                            # Use autocast to handle dtype mismatch (input FP16, weights FP32)
-                            with torch.cuda.amp.autocast():
+                            # Use autocast for both forward and loss computation for consistency
+                            with torch.amp.autocast('cuda'):
                                 _ = qlayer(
                                     quant_inps[j].unsqueeze(0),
                                     attention_mask=attention_mask,
                                     position_ids=position_ids
                                 )
-                            router_logits = get_logits()
+                                router_logits = get_logits()
+                                
+                                if router_logits is not None:
+                                    if router_logits.dim() == 2:
+                                        router_logits = router_logits.unsqueeze(0)
+                                    
+                                    if teacher_indices.dim() == 2:
+                                        teacher_prob_sample = teacher_probs[j*seqlen:(j+1)*seqlen].unsqueeze(0)
+                                        teacher_idx_sample = teacher_indices[j*seqlen:(j+1)*seqlen].unsqueeze(0)
+                                    else:
+                                        teacher_prob_sample = teacher_probs[j:j+1]
+                                        teacher_idx_sample = teacher_indices[j:j+1]
+                                    
+                                    # Convert logits to float32 for stable loss computation
+                                    loss = compute_topk_mse_loss(
+                                        router_logits.float(),
+                                        teacher_prob_sample,
+                                        teacher_idx_sample,
+                                        debug=(j == 0 and epoch == 0)
+                                    )
                             
-                            if router_logits is not None:
-                                if router_logits.dim() == 2:
-                                    router_logits = router_logits.unsqueeze(0)
+                            if router_logits is not None and not (torch.isnan(loss) or torch.isinf(loss)):
+                                # Use GradScaler for proper mixed precision backward
+                                grad_scaler.scale(loss).backward()
                                 
-                                if teacher_indices.dim() == 2:
-                                    teacher_prob_sample = teacher_probs[j*seqlen:(j+1)*seqlen].unsqueeze(0)
-                                    teacher_idx_sample = teacher_indices[j*seqlen:(j+1)*seqlen].unsqueeze(0)
-                                else:
-                                    teacher_prob_sample = teacher_probs[j:j+1]
-                                    teacher_idx_sample = teacher_indices[j:j+1]
+                                # Unscale gradients and clip to prevent explosion
+                                grad_scaler.unscale_(router_optimizer)
+                                torch.nn.utils.clip_grad_norm_(router_gate_params, max_norm=1.0)
                                 
-                                loss = compute_topk_mse_loss(
-                                    router_logits,
-                                    teacher_prob_sample,
-                                    teacher_idx_sample,
-                                    debug=(epoch == 0 and j == 0)
-                                )
+                                # Check for NaN gradients before stepping
+                                has_nan_grad = any(p.grad is not None and torch.isnan(p.grad).any() for p in router_gate_params)
+                                if not has_nan_grad:
+                                    grad_scaler.step(router_optimizer)
+                                    epoch_loss += loss.item()
+                                    valid_samples += 1
                                 
-                                if torch.isnan(loss) or torch.isinf(loss):
-                                    continue
-                                
-                                loss.backward()
-                                router_optimizer.step()
-                                epoch_loss += loss.item()
-                                valid_samples += 1
+                                grad_scaler.update()
                         
                         avg_loss = epoch_loss / max(valid_samples, 1)
                         logger.info(f"[Router Calibration] Layer {i} Epoch {epoch}: TopK-MSE Loss = {avg_loss:.6f} ({valid_samples}/{args.nsamples} valid)")
@@ -546,7 +559,7 @@ def omniquant(
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
         if args.epochs > 0:
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     for j in range(args.nsamples):
                         fp_inps[j] = qlayer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
                         if args.aug_loss:
@@ -759,7 +772,7 @@ def omniquant(
                 num_samples = min(args.nsamples, 8)
                 for j in range(num_samples):
                     # Use hook-based forward to get router logits
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         out, router_logits = forward_with_router_logits(
                             qlayer,
                             quant_inps[j].unsqueeze(0),
