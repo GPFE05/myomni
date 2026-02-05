@@ -373,12 +373,14 @@ def omniquant(
                             smooth_and_quant_temporary(layer, args, is_llama)
                         
                         # Use hook-based forward to get router logits
-                        out, router_logits = forward_with_router_logits(
-                            layer,
-                            inputs[j].unsqueeze(0),
-                            attention_mask=attention_mask,
-                            position_ids=position_ids
-                        )
+                        # Use autocast to handle dtype mismatch (input FP16, weights FP32)
+                        with torch.cuda.amp.autocast():
+                            out, router_logits = forward_with_router_logits(
+                                layer,
+                                inputs[j].unsqueeze(0),
+                                attention_mask=attention_mask,
+                                position_ids=position_ids
+                            )
                         
                         # Clear temporary quantization
                         if apply_quant:
@@ -758,7 +760,8 @@ def omniquant(
                     smooth_and_quant_temporary(qlayer, args, is_llama)
                     
                     # Use hook-based forward to get router logits
-                    out, router_logits = forward_with_router_logits(
+                    with torch.cuda.amp.autocast():
+                     out, router_logits = forward_with_router_logits(
                         qlayer,
                         quant_inps[j].unsqueeze(0),
                         attention_mask=attention_mask,
