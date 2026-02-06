@@ -124,7 +124,14 @@ def omniquant(
             wandb = _wandb
         except ImportError:
             logger.warning("WandB not installed but enable_wandb=True. Skipping WandB logging.")
-    global_step = 0  # Global step counter for continuous WandB logging across layers
+    global_step = 0  # Global step counter for MAIN training (keeps curve aligned with pre-router behavior)
+    router_calib_step = 0  # Separate step counter for router calibration logs
+    if wandb is not None:
+        # Define custom step metrics to avoid mixed axes between router calibration and training
+        wandb.define_metric("router_calib/*", step_metric="router_calib_step")
+        wandb.define_metric("train/*", step_metric="global_step")
+        wandb.define_metric("grad/*", step_metric="global_step")
+        wandb.define_metric("lr/*", step_metric="global_step")
     
     # move embedding layer and first layer to target device
     model = lm.model
@@ -523,8 +530,8 @@ def omniquant(
                                 "router_calib/loss": avg_loss,
                                 "router_calib/layer_id": i,
                                 "router_calib/epoch": epoch,
-                            }, step=global_step)
-                            global_step += 1
+                            }, step=router_calib_step)
+                            router_calib_step += 1
                     
                     hook_handle.remove()
                     del router_optimizer
@@ -556,7 +563,8 @@ def omniquant(
                             "router_calib/post_shift_all": post_shift_all,
                             "router_calib/improvement_any": pre_shift_any - post_shift_any,
                             "router_calib/layer_id": i,
-                        }, step=global_step)
+                        }, step=router_calib_step)
+                        router_calib_step += 1
                 
                 # Store for final comparison after LWC
                 router_calib_pre_shift = (pre_shift_any, pre_shift_half, pre_shift_all)
@@ -837,7 +845,8 @@ def omniquant(
                         "router_calib/final_shift_half": final_shift_half,
                         "router_calib/final_shift_all": final_shift_all,
                         "router_calib/layer_id": i,
-                    }, step=global_step)
+                    }, step=router_calib_step)
+                    router_calib_step += 1
             
             # Clean up temp_weight
             clear_temp_variable(qlayer)
