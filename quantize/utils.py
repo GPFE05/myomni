@@ -38,9 +38,9 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
     def hook_fn(module, input, output):
         # Router gate output shape can be [batch*seq_len, num_experts] or [batch, seq_len, num_experts]
         logits = output.detach()
-        # Use float32 for numerical stability in softmax
-        probs = torch.softmax(logits.float(), dim=-1)
-        values, indices = torch.topk(probs, k=topk, dim=-1)
+        # Use raw logits (no softmax) for topk selection and loss computation
+        logits_f32 = logits.float()
+        values, indices = torch.topk(logits_f32, k=topk, dim=-1)
         # Keep values in float32 to avoid NaN issues later
         captured_data.append((values, indices))
     
@@ -225,50 +225,45 @@ def create_router_hook():
 # =============================================================================
 # Router Calibration Loss Functions
 # =============================================================================
-def compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices, debug=False):
+def compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices, debug=False):
     """
-    Compute TopK-MSE loss for router calibration.
+    Compute TopK-MSE loss for router calibration using raw logits (no softmax).
     
     Args:
         student_logits: Router logits from student [batch, seq, num_experts]
-        teacher_probs: Top-k probability values from teacher [batch, seq, topk]
+        teacher_logits: Top-k raw logit values from teacher [batch, seq, topk]
         teacher_indices: Top-k expert indices from teacher [batch, seq, topk]
         debug: If True, print debug information
     
     Returns:
-        loss: MSE loss between gathered student probs and teacher probs
+        loss: MSE loss between gathered student logits and teacher logits at top-k positions
     """
-    # Use float32 for numerical stability in softmax computation
-    # FP16 softmax can overflow/underflow easily
+    # Use float32 for numerical stability
     student_logits_f32 = student_logits.float()
-    
-    # Compute student probabilities in float32 for stability
-    student_probs = torch.softmax(student_logits_f32, dim=-1)  # [batch, seq, num_experts]
     
     # Ensure teacher tensors are on same device and use float32
     teacher_indices = teacher_indices.to(student_logits.device)
-    teacher_probs_f32 = teacher_probs.to(device=student_logits.device).float()
+    teacher_logits_f32 = teacher_logits.to(device=student_logits.device).float()
     
-    # Gather student probabilities at teacher's top-k indices
-    gathered_student_probs = torch.gather(student_probs, dim=-1, index=teacher_indices)
+    # Gather student raw logits at teacher's top-k indices
+    gathered_student_logits = torch.gather(student_logits_f32, dim=-1, index=teacher_indices)
     
     if debug:
-        print(f"[DEBUG] compute_topk_mse_loss:")
+        print(f"[DEBUG] compute_topk_mse_loss (raw logits):")
         print(f"  student_logits: min={student_logits.min().item():.4f}, max={student_logits.max().item():.4f}")
-        print(f"  student_probs: min={student_probs.min().item():.6f}, max={student_probs.max().item():.6f}")
-        print(f"  teacher_probs: min={teacher_probs_f32.min().item():.6f}, max={teacher_probs_f32.max().item():.6f}")
-        print(f"  gathered_student_probs: min={gathered_student_probs.min().item():.6f}, max={gathered_student_probs.max().item():.6f}")
-        print(f"  Any NaN in student_probs: {torch.isnan(student_probs).any().item()}")
-        print(f"  Any NaN in teacher_probs: {torch.isnan(teacher_probs_f32).any().item()}")
+        print(f"  gathered_student_logits: min={gathered_student_logits.min().item():.6f}, max={gathered_student_logits.max().item():.6f}")
+        print(f"  teacher_logits: min={teacher_logits_f32.min().item():.6f}, max={teacher_logits_f32.max().item():.6f}")
+        print(f"  Any NaN in student_logits: {torch.isnan(student_logits_f32).any().item()}")
+        print(f"  Any NaN in teacher_logits: {torch.isnan(teacher_logits_f32).any().item()}")
     
     # Check for NaN and handle gracefully
-    if torch.isnan(student_probs).any() or torch.isnan(teacher_probs_f32).any():
+    if torch.isnan(student_logits_f32).any() or torch.isnan(teacher_logits_f32).any():
         print(f"[WARNING] NaN detected in compute_topk_mse_loss!")
         # Return zero loss to avoid corrupting gradients
         return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
     
-    # Compute MSE loss in float32
-    loss = F.mse_loss(gathered_student_probs, teacher_probs_f32)
+    # Compute MSE loss on raw logits in float32
+    loss = F.mse_loss(gathered_student_logits, teacher_logits_f32)
     
     return loss
 

@@ -30,12 +30,12 @@ class TestComputeTopkMseLoss:
         # Create student logits
         student_logits = torch.randn(batch_size, seq_len, num_experts)
         
-        # Create teacher probs and indices (simulating cached labels)
-        teacher_probs = torch.softmax(torch.randn(batch_size, seq_len, topk), dim=-1)
+        # Create teacher logits and indices (simulating cached raw logit labels)
+        teacher_logits = torch.randn(batch_size, seq_len, topk)
         teacher_indices = torch.randint(0, num_experts, (batch_size, seq_len, topk))
         
         # Compute loss
-        loss = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices)
+        loss = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices)
         
         # Verify output
         assert loss.shape == torch.Size([]), "Loss should be a scalar"
@@ -61,11 +61,10 @@ class TestComputeTopkMseLoss:
                     idx = teacher_indices[b, s, k].item()
                     student_logits[b, s, idx] = 10.0 - k  # Decreasing logits
         
-        # Compute student probs and use as teacher probs
-        student_probs = torch.softmax(student_logits, dim=-1)
-        teacher_probs = torch.gather(student_probs, dim=-1, index=teacher_indices)
+        # Use raw logits gathered at teacher indices as teacher values
+        teacher_logits = torch.gather(student_logits, dim=-1, index=teacher_indices)
         
-        loss = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices)
+        loss = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices)
         
         # Loss should be very close to zero
         assert loss.item() < 1e-5, f"Loss should be near zero for perfect match, got {loss.item()}"
@@ -77,10 +76,10 @@ class TestComputeTopkMseLoss:
         
         # Create FP16 tensors
         student_logits = torch.randn(batch_size, seq_len, num_experts, dtype=torch.float16)
-        teacher_probs = torch.softmax(torch.randn(batch_size, seq_len, topk, dtype=torch.float32), dim=-1).half()
+        teacher_logits = torch.randn(batch_size, seq_len, topk, dtype=torch.float16)
         teacher_indices = torch.randint(0, num_experts, (batch_size, seq_len, topk))
         
-        loss = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices)
+        loss = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices)
         
         assert not torch.isnan(loss), "Loss should not be NaN with FP16 inputs"
         assert not torch.isinf(loss), "Loss should not be inf with FP16 inputs"
@@ -95,10 +94,10 @@ class TestComputeTopkMseLoss:
         student_logits[0, 0, 0] = 100.0  # Very large positive
         student_logits[0, 0, 1] = -100.0  # Very large negative
         
-        teacher_probs = torch.softmax(torch.randn(batch_size, seq_len, topk), dim=-1)
+        teacher_logits = torch.randn(batch_size, seq_len, topk)
         teacher_indices = torch.randint(0, num_experts, (batch_size, seq_len, topk))
         
-        loss = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices)
+        loss = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices)
         
         assert not torch.isnan(loss), "Loss should not be NaN with extreme logits"
         assert not torch.isinf(loss), "Loss should not be inf with extreme logits"
@@ -112,28 +111,28 @@ class TestComputeTopkMseLoss:
         student_logits = torch.randn(batch_size, seq_len, num_experts)
         student_logits[0, 0, 0] = float('nan')
         
-        teacher_probs = torch.softmax(torch.randn(batch_size, seq_len, topk), dim=-1)
+        teacher_logits = torch.randn(batch_size, seq_len, topk)
         teacher_indices = torch.randint(0, num_experts, (batch_size, seq_len, topk))
         
-        loss = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices)
+        loss = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices)
         
         # Function should return zero loss when NaN is detected
         assert loss.item() == 0.0, "Loss should be 0 when NaN is detected in inputs"
     
-    def test_nan_teacher_probs_handling(self):
-        """Test that NaN in teacher probs is handled gracefully."""
+    def test_nan_teacher_logits_handling(self):
+        """Test that NaN in teacher logits is handled gracefully."""
         batch_size, seq_len, num_experts = 2, 4, 8
         topk = 3
         
         student_logits = torch.randn(batch_size, seq_len, num_experts)
-        teacher_probs = torch.softmax(torch.randn(batch_size, seq_len, topk), dim=-1)
-        teacher_probs[0, 0, 0] = float('nan')
+        teacher_logits = torch.randn(batch_size, seq_len, topk)
+        teacher_logits[0, 0, 0] = float('nan')
         teacher_indices = torch.randint(0, num_experts, (batch_size, seq_len, topk))
         
-        loss = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices)
+        loss = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices)
         
         # Function should return zero loss when NaN is detected
-        assert loss.item() == 0.0, "Loss should be 0 when NaN is detected in teacher_probs"
+        assert loss.item() == 0.0, "Loss should be 0 when NaN is detected in teacher_logits"
     
     def test_gradient_flow(self):
         """Test that gradients flow correctly through the loss."""
@@ -141,10 +140,10 @@ class TestComputeTopkMseLoss:
         topk = 3
         
         student_logits = torch.randn(batch_size, seq_len, num_experts, requires_grad=True)
-        teacher_probs = torch.softmax(torch.randn(batch_size, seq_len, topk), dim=-1)
+        teacher_logits = torch.randn(batch_size, seq_len, topk)
         teacher_indices = torch.randint(0, num_experts, (batch_size, seq_len, topk))
         
-        loss = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices)
+        loss = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices)
         loss.backward()
         
         assert student_logits.grad is not None, "Gradients should flow to student_logits"
@@ -156,11 +155,11 @@ class TestComputeTopkMseLoss:
         topk = 3
         
         student_logits = torch.randn(batch_size, seq_len, num_experts)
-        teacher_probs = torch.softmax(torch.randn(batch_size, seq_len, topk), dim=-1)
+        teacher_logits = torch.randn(batch_size, seq_len, topk)
         teacher_indices = torch.randint(0, num_experts, (batch_size, seq_len, topk))
         
         # Should not raise any exceptions
-        loss = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices, debug=True)
+        loss = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices, debug=True)
         
         assert not torch.isnan(loss), "Loss should not be NaN in debug mode"
     
@@ -175,10 +174,10 @@ class TestComputeTopkMseLoss:
         
         # Create tensors on different devices
         student_logits = torch.randn(batch_size, seq_len, num_experts, device='cuda')
-        teacher_probs = torch.softmax(torch.randn(batch_size, seq_len, topk), dim=-1)  # CPU
+        teacher_logits = torch.randn(batch_size, seq_len, topk)  # CPU
         teacher_indices = torch.randint(0, num_experts, (batch_size, seq_len, topk))  # CPU
         
-        loss = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices)
+        loss = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices)
         
         assert loss.device.type == 'cuda', "Loss should be on same device as student_logits"
         assert not torch.isnan(loss), "Loss should not be NaN with cross-device inputs"
@@ -189,10 +188,10 @@ class TestComputeTopkMseLoss:
         topk = 20
         
         student_logits = torch.randn(batch_size, seq_len, num_experts)
-        teacher_probs = torch.softmax(torch.randn(batch_size, seq_len, topk), dim=-1)
+        teacher_logits = torch.randn(batch_size, seq_len, topk)
         teacher_indices = torch.randint(0, num_experts, (batch_size, seq_len, topk))
         
-        loss = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices)
+        loss = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices)
         
         assert not torch.isnan(loss), "Loss should not be NaN with large batch"
         assert not torch.isinf(loss), "Loss should not be inf with large batch"
@@ -203,16 +202,16 @@ class TestComputeTopkMseLoss:
         topk = 3
         
         student_logits = torch.randn(batch_size, seq_len, num_experts)
-        teacher_probs = torch.softmax(torch.randn(batch_size, seq_len, topk), dim=-1)
+        teacher_logits = torch.randn(batch_size, seq_len, topk)
         
         # Test with int32 indices
         teacher_indices_int32 = torch.randint(0, num_experts, (batch_size, seq_len, topk), dtype=torch.int32)
-        loss_int32 = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices_int32)
+        loss_int32 = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices_int32)
         assert not torch.isnan(loss_int32), "Loss should work with int32 indices"
         
         # Test with int64 indices
         teacher_indices_int64 = torch.randint(0, num_experts, (batch_size, seq_len, topk), dtype=torch.int64)
-        loss_int64 = compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices_int64)
+        loss_int64 = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices_int64)
         assert not torch.isnan(loss_int64), "Loss should work with int64 indices"
 
 
@@ -226,7 +225,7 @@ def run_tests():
         'test_fp16_inputs',
         'test_extreme_logits',
         'test_nan_input_handling',
-        'test_nan_teacher_probs_handling',
+        'test_nan_teacher_logits_handling',
         'test_gradient_flow',
         'test_debug_mode',
         'test_large_batch',

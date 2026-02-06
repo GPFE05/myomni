@@ -352,8 +352,8 @@ def omniquant(
             )
             
             if cached_router_labels is not None:
-                teacher_probs, teacher_indices = cached_router_labels
-                logger.info(f"[Router Calibration] Layer {i}: teacher_probs shape={teacher_probs.shape}, teacher_indices shape={teacher_indices.shape}")
+                teacher_logits, teacher_indices = cached_router_labels
+                logger.info(f"[Router Calibration] Layer {i}: teacher_logits shape={teacher_logits.shape}, teacher_indices shape={teacher_indices.shape}")
                 seqlen = fp_inps.shape[1]
                 
                 # ============================================================
@@ -495,16 +495,16 @@ def omniquant(
                                     router_logits = router_logits.unsqueeze(0)
                                 
                                 if teacher_indices.dim() == 2:
-                                    teacher_prob_sample = teacher_probs[j*seqlen:(j+1)*seqlen].unsqueeze(0)
+                                    teacher_logit_sample = teacher_logits[j*seqlen:(j+1)*seqlen].unsqueeze(0)
                                     teacher_idx_sample = teacher_indices[j*seqlen:(j+1)*seqlen].unsqueeze(0)
                                 else:
-                                    teacher_prob_sample = teacher_probs[j:j+1]
+                                    teacher_logit_sample = teacher_logits[j:j+1]
                                     teacher_idx_sample = teacher_indices[j:j+1]
                                 
                                 # Compute loss in FP32 for numerical stability
                                 loss = compute_topk_mse_loss(
                                     router_logits.float(),
-                                    teacher_prob_sample,
+                                    teacher_logit_sample,
                                     teacher_idx_sample,
                                     debug=(j == 0 and epoch == 0)
                                 )
@@ -786,7 +786,7 @@ def omniquant(
         # Final Expert Shift Check (after main LWC quantization training)
         # =================================================================
         if is_qwen_moe and calibrate_router and cached_router_labels is not None:
-            teacher_probs, teacher_indices = cached_router_labels
+            teacher_logits, teacher_indices = cached_router_labels
             seqlen = fp_inps.shape[1]
             
             # Create temp_weight ONCE for all samples
