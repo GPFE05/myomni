@@ -285,23 +285,42 @@ def evaluate(lm, args, logger):
         try:
             import wandb
 
-            # 1. Standard Logging (Line charts/history)
-            wandb.log(results)
+            # 1. Group metrics by type for organized visualization
+            # PPL tasks (wikitext2, c4) -> eval_ppl/*
+            # Other tasks -> eval_task/*
+            ppl_tasks = {"wikitext2", "c4", "ptb", "ptb-new", "c4-new"}
+            grouped_results = {}
+            for k, v in results.items():
+                if isinstance(v, (int, float)):
+                    if k.lower() in ppl_tasks:
+                        grouped_results[f"eval_ppl/{k}"] = v
+                    else:
+                        grouped_results[f"eval_task/{k}"] = v
+            
+            # Log grouped metrics (separate charts for PPL and Tasks)
+            wandb.log(grouped_results)
 
-            # 2. Bar Chart Visualization (Summary)
-            # Filter for numeric values only
-            table_data = [[k, v] for k, v in results.items() if isinstance(v, (int, float))]
-
-            # Create a WandB Table
-            table = wandb.Table(data=table_data, columns=["Task Name", "Metric Value"])
-
-            # Create and log the Bar Chart
-            wandb.log({
-                "final_evaluation_summary": wandb.plot.bar(
-                    table, "Task Name", "Metric Value", title="Evaluation Metrics Summary"
-                )
-            })
-            logger.info("Uploaded evaluation summary to WandB.")
+            # 2. Bar Chart Visualization (Summary) - PPL tasks
+            ppl_data = [[k.replace("eval_ppl/", ""), v] for k, v in grouped_results.items() if k.startswith("eval_ppl/")]
+            if ppl_data:
+                ppl_table = wandb.Table(data=ppl_data, columns=["Dataset", "PPL"])
+                wandb.log({
+                    "eval_ppl/summary_chart": wandb.plot.bar(
+                        ppl_table, "Dataset", "PPL", title="PPL Evaluation (wikitext2, c4)"
+                    )
+                })
+            
+            # 3. Bar Chart Visualization (Summary) - Task results
+            task_data = [[k.replace("eval_task/", ""), v] for k, v in grouped_results.items() if k.startswith("eval_task/")]
+            if task_data:
+                task_table = wandb.Table(data=task_data, columns=["Task", "Accuracy"])
+                wandb.log({
+                    "eval_task/summary_chart": wandb.plot.bar(
+                        task_table, "Task", "Accuracy", title="Task Evaluation Summary"
+                    )
+                })
+            
+            logger.info("Uploaded evaluation summary to WandB (grouped by eval_ppl and eval_task).")
 
         except Exception as e:
             logger.warning(f"Failed to upload results to wandb: {e}")

@@ -125,10 +125,9 @@ def omniquant(
         except ImportError:
             logger.warning("WandB not installed but enable_wandb=True. Skipping WandB logging.")
     global_step = 0  # Global step counter for MAIN training (keeps curve aligned with pre-router behavior)
-    router_calib_step = 0  # Separate step counter for router calibration logs
+    expert_shift_data = []  # Collect expert shift data per layer for visualization: [(layer_id, pre_any, pre_half, pre_all, post_any, post_half, post_all), ...]
     if wandb is not None:
-        # Define custom step metrics to avoid mixed axes between router calibration and training
-        wandb.define_metric("router_calib/*", step_metric="router_calib_step")
+        # Define custom step metrics for training
         wandb.define_metric("train/*", step_metric="global_step")
         wandb.define_metric("grad/*", step_metric="global_step")
         wandb.define_metric("lr/*", step_metric="global_step")
@@ -320,23 +319,24 @@ def omniquant(
         qlayer = qlayer.to(dev)
 
         # =================================================================
-        # Router Calibration for Qwen2-MoE (Task 4)
+        # Expert Shift Tracking for Qwen2-MoE
         # Flow: 
         #   1. Capture FP16 teacher labels from ORIGINAL layer
         #   2. Set quantization state on qlayer
-        #   3. Compute Pre-Calibration Expert Shift (quantized vs FP teacher)
-        #   4. Router calibration training
-        #   5. Compute Post-Calibration Expert Shift
-        #   6. Continue to LWC training
-        #   7. Compute Final Expert Shift (after LWC)
+        #   3. Compute Pre-LWC Expert Shift (quantized vs FP teacher)
+        #   4. (Optional) Router calibration training if calibrate_router=True
+        #   5. (Optional) Compute Post-Calibration Expert Shift
+        #   6. LWC training
+        #   7. Compute Post-LWC Expert Shift
         # =================================================================
         is_qwen_moe = "qwen" in args.net.lower()
         cached_router_labels = None
+        pre_lwc_shift = None
         
-        if is_qwen_moe and calibrate_router:
-            logger.info(f"[Router Calibration] Layer {i}: Starting router calibration...")
+        if is_qwen_moe:
+            logger.info(f"[Expert Shift] Layer {i}: Starting expert shift tracking...")
             
-            # Convert qlayer to FP32 for stable router calibration (same as LWC training)
+            # Convert qlayer to FP32 for stable computation (same as LWC training)
             # This is required because:
             # 1. V100 doesn't support BF16, and autocast converts to FP16 which can cause precision issues
             # 2. GradScaler doesn't support FP16 gradients
@@ -346,20 +346,20 @@ def omniquant(
             # ============================================================
             # Phase A: Capture FP16 router labels from ORIGINAL layer
             # ============================================================
-            logger.info(f"[Router Calibration] Layer {i}: Phase A - Capturing FP16 router labels (topk={k_loss})...")
+            logger.info(f"[Expert Shift] Layer {i}: Capturing FP16 router labels (topk={k_loss})...")
             cached_router_labels = capture_router_labels_layerwise(
                 layer, fp_inps, attention_mask, position_ids, dev, topk=k_loss, logger=logger
             )
             
             if cached_router_labels is not None:
                 teacher_logits, teacher_indices = cached_router_labels
-                logger.info(f"[Router Calibration] Layer {i}: teacher_logits shape={teacher_logits.shape}, teacher_indices shape={teacher_indices.shape}")
+                logger.info(f"[Expert Shift] Layer {i}: teacher_logits shape={teacher_logits.shape}, teacher_indices shape={teacher_indices.shape}")
                 seqlen = fp_inps.shape[1]
                 
                 # ============================================================
-                # Phase B: Set quantization state and compute Pre-Calib Shift
+                # Phase B: Set quantization state and compute Pre-LWC Shift
                 # ============================================================
-                logger.info(f"[Router Calibration] Layer {i}: Phase B - Setting quantization state...")
+                logger.info(f"[Expert Shift] Layer {i}: Setting quantization state...")
                 
                 # Set quantization state BEFORE computing expert shift
                 # weight_quant=True: use quantized weights (temp_weight) to measure real quantization impact
@@ -409,178 +409,151 @@ def omniquant(
                     n = min(num_samples, inputs.shape[0])
                     return shift_any_sum / n, shift_half_sum / n, shift_all_sum / n
                 
-                # Compute Pre-Calibration Expert Shift (temp_weight already set)
+                # Compute Pre-LWC Expert Shift (temp_weight already set)
                 with torch.no_grad():
                     pre_shift_any, pre_shift_half, pre_shift_all = compute_shift_metrics(
                         qlayer, quant_inps, teacher_indices, 
-                        num_samples=8, desc="Pre-Calib"
+                        num_samples=8, desc="Pre-LWC"
                     )
-                    logger.info(f"[Router Calibration] Layer {i}: Pre-Calib Expert Shift (Quantized vs FP) - Any: {pre_shift_any:.4f}, Half: {pre_shift_half:.4f}, All: {pre_shift_all:.4f}")
+                    logger.info(f"[Expert Shift] Layer {i}: Pre-LWC Expert Shift (Quantized vs FP) - Any: {pre_shift_any:.4f}, Half: {pre_shift_half:.4f}, All: {pre_shift_all:.4f}")
+                    pre_lwc_shift = (pre_shift_any, pre_shift_half, pre_shift_all)
                 
                 # ============================================================
-                # Phase C: Router Calibration Training
+                # Phase C: Router Calibration Training (Optional)
                 # ============================================================
+                # Only executed when calibrate_router=True
                 # Goal: Train router to mimic FP16 expert selection UNDER QUANTIZED CONDITIONS
                 # - Keep quantization enabled so router sees quantized hidden states
                 # - temp_weight is already set from Phase B, no need to recreate
-                logger.info(f"[Router Calibration] Layer {i}: Phase C - Router calibration training (epochs={router_epochs}, lr={router_lr})...")
+                if calibrate_router:
+                    logger.info(f"[Router Calibration] Layer {i}: Router calibration training (epochs={router_epochs}, lr={router_lr})...")
                 
-                # Freeze ALL parameters except router gate
-                saved_requires_grad = {}
-                for name, param in qlayer.named_parameters():
-                    saved_requires_grad[name] = param.requires_grad
-                    param.requires_grad = False
-                
-                # Enable gradient only for router gate (directly on qlayer, not wrapped)
-                # Support both nn.Linear and LoraLinear (when train_gate_lora is enabled)
-                router_gate_params = []
-                seen_params = set()
-                router_gate_module = None
-                for name, module in qlayer.named_modules():
-                    if name.endswith("mlp.gate"):
-                        router_gate_module = module
-                        if isinstance(module, LoraLinear):
-                            # For LoraLinear: train the original weight only, not LoRA matrices
-                            # Temporarily enable gradient for the frozen weight
-                            if id(module.weight) not in seen_params:
-                                module.weight.requires_grad = True
-                                router_gate_params.append(module.weight)
-                                seen_params.add(id(module.weight))
-                                if module.bias is not None and id(module.bias) not in seen_params:
-                                    module.bias.requires_grad = True
-                                    router_gate_params.append(module.bias)
-                                    seen_params.add(id(module.bias))
-                                logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name} (LoraLinear.weight)")
-                        elif isinstance(module, nn.Linear):
-                            if id(module.weight) not in seen_params:
-                                module.weight.requires_grad = True
-                                router_gate_params.append(module.weight)
-                                seen_params.add(id(module.weight))
-                                if module.bias is not None and id(module.bias) not in seen_params:
-                                    module.bias.requires_grad = True
-                                    router_gate_params.append(module.bias)
-                                    seen_params.add(id(module.bias))
-                                logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name} (nn.Linear)")
-                
-                if router_gate_params:
-                    logger.info(f"[Router Calibration] Layer {i}: {len(router_gate_params)} unique parameters to optimize")
+                    # Freeze ALL parameters except router gate
+                    saved_requires_grad = {}
+                    for name, param in qlayer.named_parameters():
+                        saved_requires_grad[name] = param.requires_grad
+                        param.requires_grad = False
                     
-                    # qlayer is already FP32 (converted at start of router calibration)
-                    router_optimizer = torch.optim.AdamW(router_gate_params, lr=router_lr, weight_decay=0)
+                    # Enable gradient only for router gate (directly on qlayer, not wrapped)
+                    # Support both nn.Linear and LoraLinear (when train_gate_lora is enabled)
+                    router_gate_params = []
+                    seen_params = set()
+                    router_gate_module = None
+                    for name, module in qlayer.named_modules():
+                        if name.endswith("mlp.gate"):
+                            router_gate_module = module
+                            if isinstance(module, LoraLinear):
+                                # For LoraLinear: train the original weight only, not LoRA matrices
+                                # Temporarily enable gradient for the frozen weight
+                                if id(module.weight) not in seen_params:
+                                    module.weight.requires_grad = True
+                                    router_gate_params.append(module.weight)
+                                    seen_params.add(id(module.weight))
+                                    if module.bias is not None and id(module.bias) not in seen_params:
+                                        module.bias.requires_grad = True
+                                        router_gate_params.append(module.bias)
+                                        seen_params.add(id(module.bias))
+                                    logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name} (LoraLinear.weight)")
+                            elif isinstance(module, nn.Linear):
+                                if id(module.weight) not in seen_params:
+                                    module.weight.requires_grad = True
+                                    router_gate_params.append(module.weight)
+                                    seen_params.add(id(module.weight))
+                                    if module.bias is not None and id(module.bias) not in seen_params:
+                                        module.bias.requires_grad = True
+                                        router_gate_params.append(module.bias)
+                                        seen_params.add(id(module.bias))
+                                    logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name} (nn.Linear)")
                     
-                    # Setup hook once for all training iterations using simple closure
-                    hook_fn, get_logits, clear_logits = create_router_hook()
-                    hook_handle = qlayer.mlp.gate.register_forward_hook(hook_fn)
-                    
-                    for epoch in range(router_epochs):
-                        epoch_loss = 0.0
-                        valid_samples = 0
-                        for j in range(args.nsamples):
-                            router_optimizer.zero_grad()
-                            clear_logits()
-                            
-                            # Forward pass - qlayer is FP32, use autocast for efficiency
-                            # Must call smooth_and_quant_temporary each iteration to recreate computation graph
-                            with torch.amp.autocast('cuda'):
-                                smooth_and_quant_temporary(qlayer, args, is_llama)
-                                _ = qlayer(
-                                    quant_inps[j].unsqueeze(0),
-                                    attention_mask=attention_mask,
-                                    position_ids=position_ids
-                                )
-                            router_logits = get_logits()
-                            
-                            if router_logits is not None:
-                                if router_logits.dim() == 2:
-                                    router_logits = router_logits.unsqueeze(0)
-                                
-                                if teacher_indices.dim() == 2:
-                                    teacher_logit_sample = teacher_logits[j*seqlen:(j+1)*seqlen].unsqueeze(0)
-                                    teacher_idx_sample = teacher_indices[j*seqlen:(j+1)*seqlen].unsqueeze(0)
-                                else:
-                                    teacher_logit_sample = teacher_logits[j:j+1]
-                                    teacher_idx_sample = teacher_indices[j:j+1]
-                                
-                                # Compute loss in FP32 for numerical stability
-                                loss = compute_topk_mse_loss(
-                                    router_logits.float(),
-                                    teacher_logit_sample,
-                                    teacher_idx_sample,
-                                    debug=(j == 0 and epoch == 0)
-                                )
-                                
-                                if not (torch.isnan(loss) or torch.isinf(loss)):
-                                    loss.backward()
-                                    
-                                    # Clip gradients to prevent explosion
-                                    torch.nn.utils.clip_grad_norm_(router_gate_params, max_norm=1.0)
-                                    
-                                    # Check for NaN gradients before stepping
-                                    has_nan_grad = any(p.grad is not None and torch.isnan(p.grad).any() for p in router_gate_params)
-                                    if not has_nan_grad:
-                                        router_optimizer.step()
-                                        epoch_loss += loss.item()
-                                        valid_samples += 1
+                    if router_gate_params:
+                        logger.info(f"[Router Calibration] Layer {i}: {len(router_gate_params)} unique parameters to optimize")
                         
-                        avg_loss = epoch_loss / max(valid_samples, 1)
-                        logger.info(f"[Router Calibration] Layer {i} Epoch {epoch}: TopK-MSE Loss = {avg_loss:.6f} ({valid_samples}/{args.nsamples} valid)")
+                        # qlayer is already FP32 (converted at start of expert shift tracking)
+                        router_optimizer = torch.optim.AdamW(router_gate_params, lr=router_lr, weight_decay=0)
                         
-                        if wandb is not None:
-                            wandb.log({
-                                "router_calib/loss": avg_loss,
-                                "router_calib/layer_id": i,
-                                "router_calib/epoch": epoch,
-                            }, step=router_calib_step)
-                            router_calib_step += 1
+                        # Setup hook once for all training iterations using simple closure
+                        hook_fn, get_logits, clear_logits = create_router_hook()
+                        hook_handle = qlayer.mlp.gate.register_forward_hook(hook_fn)
+                        
+                        for epoch in range(router_epochs):
+                            epoch_loss = 0.0
+                            valid_samples = 0
+                            for j in range(args.nsamples):
+                                router_optimizer.zero_grad()
+                                clear_logits()
+                                
+                                # Forward pass - qlayer is FP32, use autocast for efficiency
+                                # Must call smooth_and_quant_temporary each iteration to recreate computation graph
+                                with torch.amp.autocast('cuda'):
+                                    smooth_and_quant_temporary(qlayer, args, is_llama)
+                                    _ = qlayer(
+                                        quant_inps[j].unsqueeze(0),
+                                        attention_mask=attention_mask,
+                                        position_ids=position_ids
+                                    )
+                                router_logits = get_logits()
+                                
+                                if router_logits is not None:
+                                    if router_logits.dim() == 2:
+                                        router_logits = router_logits.unsqueeze(0)
+                                    
+                                    if teacher_indices.dim() == 2:
+                                        teacher_logit_sample = teacher_logits[j*seqlen:(j+1)*seqlen].unsqueeze(0)
+                                        teacher_idx_sample = teacher_indices[j*seqlen:(j+1)*seqlen].unsqueeze(0)
+                                    else:
+                                        teacher_logit_sample = teacher_logits[j:j+1]
+                                        teacher_idx_sample = teacher_indices[j:j+1]
+                                    
+                                    # Compute loss in FP32 for numerical stability
+                                    loss = compute_topk_mse_loss(
+                                        router_logits.float(),
+                                        teacher_logit_sample,
+                                        teacher_idx_sample,
+                                        debug=(j == 0 and epoch == 0)
+                                    )
+                                    
+                                    if not (torch.isnan(loss) or torch.isinf(loss)):
+                                        loss.backward()
+                                        
+                                        # Clip gradients to prevent explosion
+                                        torch.nn.utils.clip_grad_norm_(router_gate_params, max_norm=1.0)
+                                        
+                                        # Check for NaN gradients before stepping
+                                        has_nan_grad = any(p.grad is not None and torch.isnan(p.grad).any() for p in router_gate_params)
+                                        if not has_nan_grad:
+                                            router_optimizer.step()
+                                            epoch_loss += loss.item()
+                                            valid_samples += 1
+                            
+                            avg_loss = epoch_loss / max(valid_samples, 1)
+                            logger.info(f"[Router Calibration] Layer {i} Epoch {epoch}: TopK-MSE Loss = {avg_loss:.6f} ({valid_samples}/{args.nsamples} valid)")
+                        
+                        hook_handle.remove()
+                        del router_optimizer
                     
-                    hook_handle.remove()
-                    del router_optimizer
-                
-                # Restore requires_grad states
-                for name, param in qlayer.named_parameters():
-                    if name in saved_requires_grad:
-                        param.requires_grad = saved_requires_grad[name]
-                
-                # ============================================================
-                # Phase D: Compute Post-Calibration Expert Shift
-                # temp_weight is still set from Phase B, reuse it
-                # ============================================================
-                with torch.no_grad():
-                    post_shift_any, post_shift_half, post_shift_all = compute_shift_metrics(
-                        qlayer, quant_inps, teacher_indices, 
-                        num_samples=8, desc=""
-                    )
-                    logger.info(f"[Router Calibration] Layer {i}: Post-Calib Expert Shift - Any: {post_shift_any:.4f}, Half: {post_shift_half:.4f}, All: {post_shift_all:.4f}")
-                    logger.info(f"[Router Calibration] Layer {i}: Router Calib Improvement - Any: {pre_shift_any - post_shift_any:.4f}, Half: {pre_shift_half - post_shift_half:.4f}, All: {pre_shift_all - post_shift_all:.4f}")
+                    # Restore requires_grad states
+                    for name, param in qlayer.named_parameters():
+                        if name in saved_requires_grad:
+                            param.requires_grad = saved_requires_grad[name]
                     
-                    if wandb is not None:
-                        wandb.log({
-                            "router_calib/pre_shift_any": pre_shift_any,
-                            "router_calib/pre_shift_half": pre_shift_half,
-                            "router_calib/pre_shift_all": pre_shift_all,
-                            "router_calib/post_shift_any": post_shift_any,
-                            "router_calib/post_shift_half": post_shift_half,
-                            "router_calib/post_shift_all": post_shift_all,
-                            "router_calib/improvement_any": pre_shift_any - post_shift_any,
-                            "router_calib/layer_id": i,
-                        }, step=router_calib_step)
-                        router_calib_step += 1
+                    # ============================================================
+                    # Phase D: Compute Post-Calibration Expert Shift
+                    # temp_weight is still set from Phase B, reuse it
+                    # ============================================================
+                    with torch.no_grad():
+                        post_shift_any, post_shift_half, post_shift_all = compute_shift_metrics(
+                            qlayer, quant_inps, teacher_indices, 
+                            num_samples=8, desc=""
+                        )
+                        logger.info(f"[Router Calibration] Layer {i}: Post-Calib Expert Shift - Any: {post_shift_any:.4f}, Half: {post_shift_half:.4f}, All: {post_shift_all:.4f}")
+                        logger.info(f"[Router Calibration] Layer {i}: Router Calib Improvement - Any: {pre_shift_any - post_shift_any:.4f}, Half: {pre_shift_half - post_shift_half:.4f}, All: {pre_shift_all - post_shift_all:.4f}")
+                    
+                    logger.info(f"[Router Calibration] Layer {i}: Router calibration complete. Continuing to LWC training...")
                 
-                # Store for final comparison after LWC
-                router_calib_pre_shift = (pre_shift_any, pre_shift_half, pre_shift_all)
-                router_calib_post_shift = (post_shift_any, post_shift_half, post_shift_all)
-                
-                # Clean up temp_weight after router calibration phases complete
+                # Clean up temp_weight after expert shift tracking / router calibration
                 clear_temp_variable(qlayer)
-                
-                logger.info(f"[Router Calibration] Layer {i}: Router calibration complete. Continuing to LWC training...")
             else:
-                logger.warning(f"[Router Calibration] Layer {i}: No router gate found, skipping calibration.")
-                router_calib_pre_shift = None
-                router_calib_post_shift = None
-        else:
-            router_calib_pre_shift = None
-            router_calib_post_shift = None
+                logger.warning(f"[Expert Shift] Layer {i}: No router gate found, skipping expert shift tracking.")
         
         # obtain output of full-precision model
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
@@ -783,9 +756,9 @@ def omniquant(
                         logger.info(f"Merged LoRA weights for {name}")
         
         # =================================================================
-        # Final Expert Shift Check (after main LWC quantization training)
+        # Post-LWC Expert Shift Check (always for Qwen MoE)
         # =================================================================
-        if is_qwen_moe and calibrate_router and cached_router_labels is not None:
+        if is_qwen_moe and cached_router_labels is not None:
             teacher_logits, teacher_indices = cached_router_labels
             seqlen = fp_inps.shape[1]
             
@@ -793,9 +766,9 @@ def omniquant(
             smooth_and_quant_temporary(qlayer, args, is_llama)
             
             with torch.no_grad():
-                final_shift_any_sum = 0.0
-                final_shift_half_sum = 0.0
-                final_shift_all_sum = 0.0
+                post_lwc_shift_any_sum = 0.0
+                post_lwc_shift_half_sum = 0.0
+                post_lwc_shift_all_sum = 0.0
                 num_samples = min(args.nsamples, 8)
                 for j in range(num_samples):
                     # Use hook-based forward to get router logits
@@ -823,30 +796,32 @@ def omniquant(
                             teacher_idx_sample,
                             k_routing
                         )
-                        final_shift_any_sum += shift_metrics["shift_any"]
-                        final_shift_half_sum += shift_metrics["shift_half"]
-                        final_shift_all_sum += shift_metrics["shift_all"]
+                        post_lwc_shift_any_sum += shift_metrics["shift_any"]
+                        post_lwc_shift_half_sum += shift_metrics["shift_half"]
+                        post_lwc_shift_all_sum += shift_metrics["shift_all"]
                 
-                final_shift_any = final_shift_any_sum / num_samples
-                final_shift_half = final_shift_half_sum / num_samples
-                final_shift_all = final_shift_all_sum / num_samples
-                logger.info(f"[Router Calibration] Layer {i}: Final Expert Shift (after LWC) - Any: {final_shift_any:.4f}, Half: {final_shift_half:.4f}, All: {final_shift_all:.4f}")
+                post_lwc_shift_any = post_lwc_shift_any_sum / num_samples
+                post_lwc_shift_half = post_lwc_shift_half_sum / num_samples
+                post_lwc_shift_all = post_lwc_shift_all_sum / num_samples
+                logger.info(f"[Expert Shift] Layer {i}: Post-LWC Expert Shift - Any: {post_lwc_shift_any:.4f}, Half: {post_lwc_shift_half:.4f}, All: {post_lwc_shift_all:.4f}")
                 
-                # Log improvement from Pre-Calib to Final
-                if router_calib_pre_shift is not None:
-                    total_improvement_any = router_calib_pre_shift[0] - final_shift_any
-                    total_improvement_half = router_calib_pre_shift[1] - final_shift_half
-                    total_improvement_all = router_calib_pre_shift[2] - final_shift_all
-                    logger.info(f"[Router Calibration] Layer {i}: Total Improvement (Pre-Calib -> Final) - Any: {total_improvement_any:.4f}, Half: {total_improvement_half:.4f}, All: {total_improvement_all:.4f}")
-                
-                if wandb is not None:
-                    wandb.log({
-                        "router_calib/final_shift_any": final_shift_any,
-                        "router_calib/final_shift_half": final_shift_half,
-                        "router_calib/final_shift_all": final_shift_all,
-                        "router_calib/layer_id": i,
-                    }, step=router_calib_step)
-                    router_calib_step += 1
+                # Log improvement from Pre-LWC to Post-LWC
+                if pre_lwc_shift is not None:
+                    lwc_improvement_any = pre_lwc_shift[0] - post_lwc_shift_any
+                    lwc_improvement_half = pre_lwc_shift[1] - post_lwc_shift_half
+                    lwc_improvement_all = pre_lwc_shift[2] - post_lwc_shift_all
+                    logger.info(f"[Expert Shift] Layer {i}: LWC Improvement (Pre-LWC -> Post-LWC) - Any: {lwc_improvement_any:.4f}, Half: {lwc_improvement_half:.4f}, All: {lwc_improvement_all:.4f}")
+                    
+                    # Collect data for visualization
+                    expert_shift_data.append({
+                        "layer": i,
+                        "pre_any": pre_lwc_shift[0],
+                        "pre_half": pre_lwc_shift[1],
+                        "pre_all": pre_lwc_shift[2],
+                        "post_any": post_lwc_shift_any,
+                        "post_half": post_lwc_shift_half,
+                        "post_all": post_lwc_shift_all,
+                    })
             
             # Clean up temp_weight
             clear_temp_variable(qlayer)
@@ -896,5 +871,57 @@ def omniquant(
     torch.cuda.empty_cache()
     gc.collect()                    
     model.config.use_cache = use_cache
+    
+    # === WandB Expert Shift Visualization (Line Chart) ===
+    # X-axis: layer index, Y-axis: expert shift ratio
+    # Each layer shows pre-LWC and post-LWC values for shift_any, shift_half, shift_all
+    if wandb is not None and len(expert_shift_data) > 0:
+        try:
+            # Create table data for line chart visualization
+            # Columns: layer, metric, phase, value
+            table_data = []
+            for entry in expert_shift_data:
+                layer = entry["layer"]
+                # Pre-LWC values
+                table_data.append([layer, "shift_any", "pre_lwc", entry["pre_any"]])
+                table_data.append([layer, "shift_half", "pre_lwc", entry["pre_half"]])
+                table_data.append([layer, "shift_all", "pre_lwc", entry["pre_all"]])
+                # Post-LWC values
+                table_data.append([layer, "shift_any", "post_lwc", entry["post_any"]])
+                table_data.append([layer, "shift_half", "post_lwc", entry["post_half"]])
+                table_data.append([layer, "shift_all", "post_lwc", entry["post_all"]])
+            
+            table = wandb.Table(data=table_data, columns=["layer", "metric", "phase", "value"])
+            
+            # Create line chart: X=layer, Y=value, grouped by metric+phase
+            wandb.log({
+                "expert_shift/shift_chart": wandb.plot.line(
+                    table, x="layer", y="value", stroke="phase",
+                    title="Expert Shift by Layer (Pre-LWC vs Post-LWC)"
+                )
+            })
+            
+            # Also create separate tables for each metric for cleaner viewing
+            for metric in ["shift_any", "shift_half", "shift_all"]:
+                metric_table_data = []
+                for entry in expert_shift_data:
+                    layer = entry["layer"]
+                    pre_key = f"pre_{metric.split('_')[1]}"  # pre_any, pre_half, pre_all
+                    post_key = f"post_{metric.split('_')[1]}"  # post_any, post_half, post_all
+                    metric_table_data.append([layer, "pre_lwc", entry[pre_key]])
+                    metric_table_data.append([layer, "post_lwc", entry[post_key]])
+                
+                metric_table = wandb.Table(data=metric_table_data, columns=["layer", "phase", "value"])
+                wandb.log({
+                    f"expert_shift/{metric}_chart": wandb.plot.line(
+                        metric_table, x="layer", y="value", stroke="phase",
+                        title=f"Expert Shift ({metric}) by Layer"
+                    )
+                })
+            
+            logger.info(f"[Expert Shift] Uploaded visualization to WandB ({len(expert_shift_data)} layers)")
+        except Exception as e:
+            logger.warning(f"[Expert Shift] Failed to create WandB visualization: {e}")
+    
     return model
 
