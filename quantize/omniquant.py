@@ -125,6 +125,7 @@ def omniquant(
         except ImportError:
             logger.warning("WandB not installed but enable_wandb=True. Skipping WandB logging.")
     global_step = 0  # Global step counter for MAIN training (keeps curve aligned with pre-router behavior)
+    final_loss = None  # Track the loss from the last epoch of the last layer
     expert_shift_data = []  # Collect expert shift data per layer for visualization: [(layer_id, pre_any, pre_half, pre_all, post_any, post_half, post_all), ...]
     if wandb is not None:
         # Define custom step metrics for training
@@ -697,6 +698,7 @@ def omniquant(
                     gate_grad_info += f" lora_grad:{lora_grad_norm:.2e}"
                 
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean}{gate_grad_info} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
+                final_loss = loss_mean.item()  # always update; after loop ends this holds last layer's last epoch loss
                 
                 # WandB logging: Log metrics with strict naming schema for Router Collapse detection
                 if wandb is not None:
@@ -923,5 +925,5 @@ def omniquant(
         except Exception as e:
             logger.warning(f"[Expert Shift] Failed to create WandB visualization: {e}")
     
-    return model
+    return model, final_loss
 

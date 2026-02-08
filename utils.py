@@ -59,6 +59,11 @@ def create_logger(output_dir, dist_rank=0, name=''):
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
+    # remove any existing handlers to avoid duplicate log output
+    # (some imported libraries may add handlers to the root logger)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
     # create formatter
     fmt = '[%(asctime)s %(name)s] (%(filename)s %(lineno)d): %(levelname)s %(message)s'
     color_fmt = colored('[%(asctime)s %(name)s]', 'green') + \

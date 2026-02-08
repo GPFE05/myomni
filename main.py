@@ -442,6 +442,19 @@ def main():
     logger = utils.create_logger(output_dir)
     logger.info(args)
 
+    # === Training Config Summary (Begin) ===
+    logger.info("=" * 60)
+    logger.info("Training Configuration Summary")
+    logger.info("=" * 60)
+    logger.info(f"  Total Epochs              : {args.epochs}")
+    logger.info(f"  Router Calibration        : {'ON' if args.calibrate_router else 'OFF'}"
+                + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
+    logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
+                + (f"  (lr={args.gate_lora_lr})" if args.train_gate_lora else ""))
+    logger.info(f"  Train Shared Gate         : {'ON' if args.train_shared_gate else 'OFF'}"
+                + (f"  (lr={args.shared_gate_lr})" if args.train_shared_gate else ""))
+    logger.info("=" * 60)
+
     if args.enable_wandb:
         try:
             import wandb
@@ -514,6 +527,7 @@ def main():
         args.act_shifts = f'./act_shifts/{args.net}.pt'
 
     # quantization
+    final_loss = None
     if args.wbits < 16 or args.abits < 16:
         logger.info("=== start quantization ===")
         tick = time.time()
@@ -536,7 +550,7 @@ def main():
         if args.let:
             act_scales = torch.load(args.act_scales, weights_only=False)
             act_shifts = torch.load(args.act_shifts, weights_only=False)
-        omniquant(
+        _, final_loss = omniquant(
             lm,
             args,
             dataloader,
@@ -573,7 +587,34 @@ def main():
                     del module.fc1_smooth_shift
         lm.model.save_pretrained(args.save_dir)
         lm.tokenizer.save_pretrained(args.save_dir)
-    evaluate(lm, args, logger)
+    results = evaluate(lm, args, logger)
+
+    # === Training & Evaluation Summary (End) ===
+    logger.info("=" * 60)
+    logger.info("Final Summary")
+    logger.info("=" * 60)
+    logger.info(f"  Total Epochs              : {args.epochs}")
+    logger.info(f"  Router Calibration        : {'ON' if args.calibrate_router else 'OFF'}"
+                + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
+    logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
+                + (f"  (lr={args.gate_lora_lr})" if args.train_gate_lora else ""))
+    logger.info(f"  Train Shared Gate         : {'ON' if args.train_shared_gate else 'OFF'}"
+                + (f"  (lr={args.shared_gate_lr})" if args.train_shared_gate else ""))
+    logger.info(f"  Final Loss                : {final_loss if final_loss is not None else 'N/A'}")
+    # PPL results
+    wiki2_ppl = results.get('wikitext2', 'N/A')
+    c4_ppl = results.get('c4', 'N/A')
+    logger.info(f"  Wikitext2 PPL             : {wiki2_ppl}")
+    logger.info(f"  C4 PPL                    : {c4_ppl}")
+    # Task evaluation results
+    task_keys = [k for k in results if k not in ('wikitext2', 'c4')]
+    if task_keys:
+        logger.info("  Task Evaluation Results:")
+        for k in task_keys:
+            logger.info(f"    {k:25s}: {results[k]}")
+    else:
+        logger.info("  Task Evaluation Results    : N/A")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
