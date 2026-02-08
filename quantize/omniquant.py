@@ -124,14 +124,9 @@ def omniquant(
             wandb = _wandb
         except ImportError:
             logger.warning("WandB not installed but enable_wandb=True. Skipping WandB logging.")
-    global_step = 0  # Global step counter for MAIN training (keeps curve aligned with pre-router behavior)
+    global_step = 0  # Global step counter for continuous WandB logging across layers
     final_loss = None  # Track the loss from the last epoch of the last layer
-    expert_shift_data = []  # Collect expert shift data per layer for visualization: [(layer_id, pre_any, pre_half, pre_all, post_any, post_half, post_all), ...]
-    if wandb is not None:
-        # Define custom step metrics for training
-        wandb.define_metric("train/*", step_metric="global_step")
-        wandb.define_metric("grad/*", step_metric="global_step")
-        wandb.define_metric("lr/*", step_metric="global_step")
+    expert_shift_data = []  # Collect expert shift data per layer for visualization
     
     # move embedding layer and first layer to target device
     model = lm.model
@@ -333,6 +328,7 @@ def omniquant(
         is_qwen_moe = "qwen" in args.net.lower()
         cached_router_labels = None
         pre_lwc_shift = None
+        post_calib_shift = None
         
         if is_qwen_moe:
             logger.info(f"[Expert Shift] Layer {i}: Starting expert shift tracking...")
@@ -548,6 +544,7 @@ def omniquant(
                         )
                         logger.info(f"[Router Calibration] Layer {i}: Post-Calib Expert Shift - Any: {post_shift_any:.4f}, Half: {post_shift_half:.4f}, All: {post_shift_all:.4f}")
                         logger.info(f"[Router Calibration] Layer {i}: Router Calib Improvement - Any: {pre_shift_any - post_shift_any:.4f}, Half: {pre_shift_half - post_shift_half:.4f}, All: {pre_shift_all - post_shift_all:.4f}")
+                        post_calib_shift = (post_shift_any, post_shift_half, post_shift_all)
                     
                     logger.info(f"[Router Calibration] Layer {i}: Router calibration complete. Continuing to LWC training...")
                 
@@ -743,6 +740,8 @@ def omniquant(
                         wandb_metrics["lr/shared_gate"] = lr_shared_gate
                     if lr_router_lora is not None:
                         wandb_metrics["lr/router_lora"] = lr_router_lora
+                    if calibrate_router:
+                        wandb_metrics["lr/router_lr"] = router_lr
                     
                     wandb.log(wandb_metrics, step=global_step)
                     global_step += 1
@@ -814,15 +813,18 @@ def omniquant(
                     lwc_improvement_all = pre_lwc_shift[2] - post_lwc_shift_all
                     logger.info(f"[Expert Shift] Layer {i}: LWC Improvement (Pre-LWC -> Post-LWC) - Any: {lwc_improvement_any:.4f}, Half: {lwc_improvement_half:.4f}, All: {lwc_improvement_all:.4f}")
                     
-                    # Collect data for visualization
+                    # Collect data for visualization (3 phases)
                     expert_shift_data.append({
                         "layer": i,
-                        "pre_any": pre_lwc_shift[0],
-                        "pre_half": pre_lwc_shift[1],
-                        "pre_all": pre_lwc_shift[2],
-                        "post_any": post_lwc_shift_any,
-                        "post_half": post_lwc_shift_half,
-                        "post_all": post_lwc_shift_all,
+                        "initial_any": pre_lwc_shift[0],
+                        "initial_half": pre_lwc_shift[1],
+                        "initial_all": pre_lwc_shift[2],
+                        "post_calib_any": post_calib_shift[0] if post_calib_shift else None,
+                        "post_calib_half": post_calib_shift[1] if post_calib_shift else None,
+                        "post_calib_all": post_calib_shift[2] if post_calib_shift else None,
+                        "post_lwc_any": post_lwc_shift_any,
+                        "post_lwc_half": post_lwc_shift_half,
+                        "post_lwc_all": post_lwc_shift_all,
                     })
             
             # Clean up temp_weight
@@ -874,54 +876,31 @@ def omniquant(
     gc.collect()                    
     model.config.use_cache = use_cache
     
-    # === WandB Expert Shift Visualization (Line Chart) ===
-    # X-axis: layer index, Y-axis: expert shift ratio
-    # Each layer shows pre-LWC and post-LWC values for shift_any, shift_half, shift_all
+    # === WandB Expert Shift Visualization (3-Phase Line Charts) ===
+    # 3 separate charts: shift_any, shift_half, shift_all
+    # Each chart: X=layer_id, lines=initial / post_router_calib(if exists) / post_lwc
     if wandb is not None and len(expert_shift_data) > 0:
         try:
-            # Create table data for line chart visualization
-            # Columns: layer, metric, phase, value
-            table_data = []
-            for entry in expert_shift_data:
-                layer = entry["layer"]
-                # Pre-LWC values
-                table_data.append([layer, "shift_any", "pre_lwc", entry["pre_any"]])
-                table_data.append([layer, "shift_half", "pre_lwc", entry["pre_half"]])
-                table_data.append([layer, "shift_all", "pre_lwc", entry["pre_all"]])
-                # Post-LWC values
-                table_data.append([layer, "shift_any", "post_lwc", entry["post_any"]])
-                table_data.append([layer, "shift_half", "post_lwc", entry["post_half"]])
-                table_data.append([layer, "shift_all", "post_lwc", entry["post_all"]])
+            has_calib = any(e.get("post_calib_any") is not None for e in expert_shift_data)
             
-            table = wandb.Table(data=table_data, columns=["layer", "metric", "phase", "value"])
-            
-            # Create line chart: X=layer, Y=value, grouped by metric+phase
-            wandb.log({
-                "expert_shift/shift_chart": wandb.plot.line(
-                    table, x="layer", y="value", stroke="phase",
-                    title="Expert Shift by Layer (Pre-LWC vs Post-LWC)"
-                )
-            })
-            
-            # Also create separate tables for each metric for cleaner viewing
-            for metric in ["shift_any", "shift_half", "shift_all"]:
-                metric_table_data = []
+            for metric in ["any", "half", "all"]:
+                table_data = []
                 for entry in expert_shift_data:
                     layer = entry["layer"]
-                    pre_key = f"pre_{metric.split('_')[1]}"  # pre_any, pre_half, pre_all
-                    post_key = f"post_{metric.split('_')[1]}"  # post_any, post_half, post_all
-                    metric_table_data.append([layer, "pre_lwc", entry[pre_key]])
-                    metric_table_data.append([layer, "post_lwc", entry[post_key]])
+                    table_data.append([layer, "initial", entry[f"initial_{metric}"]])
+                    if has_calib and entry.get(f"post_calib_{metric}") is not None:
+                        table_data.append([layer, "post_router_calib", entry[f"post_calib_{metric}"]])
+                    table_data.append([layer, "post_lwc", entry[f"post_lwc_{metric}"]])
                 
-                metric_table = wandb.Table(data=metric_table_data, columns=["layer", "phase", "value"])
+                table = wandb.Table(data=table_data, columns=["layer", "phase", "value"])
                 wandb.log({
-                    f"expert_shift/{metric}_chart": wandb.plot.line(
-                        metric_table, x="layer", y="value", stroke="phase",
-                        title=f"Expert Shift ({metric}) by Layer"
+                    f"expert_shift/shift_{metric}": wandb.plot.line(
+                        table, x="layer", y="value", stroke="phase",
+                        title=f"Expert Shift (shift_{metric}) by Layer"
                     )
                 })
             
-            logger.info(f"[Expert Shift] Uploaded visualization to WandB ({len(expert_shift_data)} layers)")
+            logger.info(f"[Expert Shift] Uploaded 3-phase visualization to WandB ({len(expert_shift_data)} layers)")
         except Exception as e:
             logger.warning(f"[Expert Shift] Failed to create WandB visualization: {e}")
     

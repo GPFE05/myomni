@@ -382,7 +382,7 @@ def main():
     parser.add_argument("--lm_eval_batch_size", type=str, default="auto",
                         help="Batch size for lm-eval tasks. Can be an integer or 'auto'.")
     parser.add_argument("--enable_wandb", action="store_true", help="enable Weights & Biases logging")
-    parser.add_argument("--wandb_project", type=str, default="omniquant", help="Weights & Biases project name")
+    parser.add_argument("--wandb_project", type=str, default="omniquant-moe", help="Weights & Biases project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name")
     parser.add_argument("--parallelize", action="store_true",
                         help="auto device_map with Accelerate; incompatible with --multigpu")
@@ -461,10 +461,12 @@ def main():
             wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
-                config=vars(args),
+                config=vars(args)
             )
+            logger.info(f"WandB initialized: project={args.wandb_project}, run={args.wandb_run_name or 'auto'}")
         except ImportError:
-            logger.warning("WandB not installed but enable_wandb=True. Skipping WandB logging.")
+            logger.warning("WandB not installed. Disabling WandB logging. Install with: pip install wandb")
+            args.enable_wandb = False
 
     # load model
     if args.net is None:
