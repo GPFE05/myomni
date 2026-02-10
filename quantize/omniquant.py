@@ -308,7 +308,9 @@ def omniquant(
                     else:
                         # Target 3: All other linear layers (including gate_proj)
                         # Replace with QuantLinear
-                        quantlinear = QuantLinear(module, args.weight_quant_params, args.act_quant_params)
+                        is_attn_linear = name.startswith("self_attn.") and name.split(".")[-1] in {"q_proj", "k_proj", "v_proj", "o_proj"}
+                        weight_params = args.attn_weight_quant_params if (is_attn_linear and args.attn_weight_quant_params is not None) else args.weight_quant_params
+                        quantlinear = QuantLinear(module, weight_params, args.act_quant_params)
                         add_new_module(name, qlayer, quantlinear)    
         else:
             qlayer = DecoderLayer(lm.model.config, layer, args)

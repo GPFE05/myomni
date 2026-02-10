@@ -360,6 +360,8 @@ def main():
         ),
     )
     parser.add_argument("--wbits", type=int, default=4)
+    parser.add_argument("--attn_wbits", type=int, default=None,
+                        help="Override wbits for attention linear layers (e.g. q/k/v/o proj).")
     parser.add_argument("--abits", type=int, default=16)
     parser.add_argument("--group_size", type=int, default=None)
     parser.add_argument("--alpha", type=float, default=0.5)
@@ -488,6 +490,13 @@ def main():
         "lwc": args.lwc,
         "disable_zero_point": args.disable_zero_point
     }
+    if args.attn_wbits is not None:
+        args.attn_weight_quant_params = {
+            **args.weight_quant_params,
+            "n_bits": args.attn_wbits
+        }
+    else:
+        args.attn_weight_quant_params = None
     args.act_quant_params = {
         "n_bits": args.abits,
         "per_channel_axes": [],
