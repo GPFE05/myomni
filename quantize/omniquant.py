@@ -9,6 +9,7 @@ from contextlib import nullcontext
 import copy
 import math
 import utils
+import io
 import os
 import pdb
 import gc
@@ -878,33 +879,60 @@ def omniquant(
     gc.collect()                    
     model.config.use_cache = use_cache
     
-    # === WandB Expert Shift Visualization (3-Phase Line Charts) ===
+    # === WandB Expert Shift Visualization (Matplotlib, 3-Phase Line Charts) ===
     # 3 separate charts: shift_any, shift_half, shift_all
-    # Each chart: X=layer_id, lines=initial / post_router_calib(if exists) / post_lwc
+    # Each chart: X=layer_id, lines=Initial / Post-Calib(if exists) / Post-LWC
     if wandb is not None and len(expert_shift_data) > 0:
         try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
             has_calib = any(e.get("post_calib_any") is not None for e in expert_shift_data)
-            
-            for metric in ["any", "half", "all"]:
-                table_data = []
-                for entry in expert_shift_data:
-                    layer = entry["layer"]
-                    table_data.append([layer, "initial", entry[f"initial_{metric}"]])
-                    if has_calib and entry.get(f"post_calib_{metric}") is not None:
-                        table_data.append([layer, "post_router_calib", entry[f"post_calib_{metric}"]])
-                    table_data.append([layer, "post_lwc", entry[f"post_lwc_{metric}"]])
-                
-                table = wandb.Table(data=table_data, columns=["layer", "phase", "value"])
-                wandb.log({
-                    f"expert_shift/shift_{metric}": wandb.plot.line(
-                        table, x="layer", y="value", stroke="phase",
-                        title=f"Expert Shift (shift_{metric}) by Layer"
-                    )
-                })
-            
-            logger.info(f"[Expert Shift] Uploaded 3-phase visualization to WandB ({len(expert_shift_data)} layers)")
+            layers = [e["layer"] for e in expert_shift_data]
+
+            phase_defs = [
+                ("initial", "Initial", {"color": "#1f77b4", "linestyle": "-", "marker": "o"}),
+                ("post_calib", "Post-Calib", {"color": "#ff7f0e", "linestyle": "--", "marker": "s"}),
+                ("post_lwc", "Post-LWC", {"color": "#2ca02c", "linestyle": "-.", "marker": "^"}),
+            ]
+
+            fig, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
+            for metric, ax in zip(["any", "half", "all"], axes):
+                for phase_key, phase_label, style in phase_defs:
+                    if phase_key == "post_calib" and not has_calib:
+                        continue
+                    xs = []
+                    ys = []
+                    for entry in expert_shift_data:
+                        value = entry.get(f"{phase_key}_{metric}")
+                        if value is None:
+                            continue
+                        xs.append(entry["layer"])
+                        ys.append(value)
+                    if xs:
+                        ax.plot(xs, ys, label=phase_label, **style)
+                ax.set_title(f"shift_{metric}")
+                ax.set_xlabel("Layer")
+                ax.set_ylabel("Shift")
+                ax.grid(True, alpha=0.3)
+                ax.legend(loc="best")
+
+            buffer = io.BytesIO()
+            fig.savefig(buffer, format="png", dpi=150)
+            plt.close(fig)
+            buffer.seek(0)
+
+            wandb.log({
+                "expert_shift/three_phase": wandb.Image(
+                    buffer, caption="Expert Shift: Initial vs Post-Calib vs Post-LWC"
+                )
+            })
+            logger.info(f"[Expert Shift] Uploaded Matplotlib visualization to WandB ({len(expert_shift_data)} layers)")
+        except ImportError:
+            logger.warning("[Expert Shift] Matplotlib not installed; skipping custom visualization.")
         except Exception as e:
-            logger.warning(f"[Expert Shift] Failed to create WandB visualization: {e}")
+            logger.warning(f"[Expert Shift] Failed to create Matplotlib visualization: {e}")
     
     return model, final_loss
 
