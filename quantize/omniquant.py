@@ -9,7 +9,6 @@ from contextlib import nullcontext
 import copy
 import math
 import utils
-import io
 import os
 import pdb
 import gc
@@ -918,16 +917,12 @@ def omniquant(
                 ax.grid(True, alpha=0.3)
                 ax.legend(loc="best")
 
-            buffer = io.BytesIO()
-            fig.savefig(buffer, format="png", dpi=150)
-            plt.close(fig)
-            buffer.seek(0)
-
             wandb.log({
                 "expert_shift/three_phase": wandb.Image(
-                    buffer, caption="Expert Shift: Initial vs Post-Calib vs Post-LWC"
+                    fig, caption="Expert Shift: Initial vs Post-Calib vs Post-LWC"
                 )
             })
+            plt.close(fig)
             logger.info(f"[Expert Shift] Uploaded Matplotlib visualization to WandB ({len(expert_shift_data)} layers)")
         except ImportError:
             logger.warning("[Expert Shift] Matplotlib not installed; skipping custom visualization.")
