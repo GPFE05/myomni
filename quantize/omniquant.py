@@ -186,12 +186,16 @@ def omniquant(
     
     
     layers[0] = layers[0].to(dev)
+    is_qwen_model = "qwen" in args.net.lower()
+    amp_dtype = torch.bfloat16 if is_qwen_model else torch.float16
+    if logger is not None:
+        logger.info(f"[AMP] model={args.net}, amp_dtype={amp_dtype}, deactive_amp={args.deactive_amp}")
     if args.deactive_amp and args.epochs>0:
         dtype = torch.float
         traincast = nullcontext
     else:
-        dtype = torch.float16
-        traincast = lambda: torch.amp.autocast('cuda')
+        dtype = amp_dtype
+        traincast = lambda: torch.amp.autocast('cuda', dtype=amp_dtype)
     inps = torch.zeros(
         (args.nsamples, lm.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
@@ -319,7 +323,7 @@ def omniquant(
         # =================================================================
         # Expert Shift Tracking for Qwen2-MoE
         # Flow: 
-        #   1. Capture FP16 teacher labels from ORIGINAL layer
+        #   1. Capture teacher labels from ORIGINAL layer under selected AMP dtype
         #   2. Set quantization state on qlayer
         #   3. Compute Pre-LWC Expert Shift (quantized vs FP teacher)
         #   4. (Optional) Router calibration training if calibrate_router=True
@@ -343,11 +347,11 @@ def omniquant(
             qlayer.float()
             
             # ============================================================
-            # Phase A: Capture FP16 router labels from ORIGINAL layer
+            # Phase A: Capture teacher router labels from ORIGINAL layer
             # ============================================================
-            logger.info(f"[Expert Shift] Layer {i}: Capturing FP16 router labels (topk={k_loss})...")
+            logger.info(f"[Expert Shift] Layer {i}: Capturing teacher router labels (topk={k_loss}, amp_dtype={amp_dtype})...")
             cached_router_labels = capture_router_labels_layerwise(
-                layer, fp_inps, attention_mask, position_ids, dev, topk=k_loss, logger=logger
+                layer, fp_inps, attention_mask, position_ids, dev, topk=k_loss, logger=logger, amp_dtype=amp_dtype
             )
             
             if cached_router_labels is not None:
@@ -381,7 +385,7 @@ def omniquant(
                     for j in range(min(num_samples, inputs.shape[0])):
                         # Use hook-based forward to get router logits
                         # Use autocast to handle dtype mismatch (input FP16, weights FP32)
-                        with torch.amp.autocast('cuda'):
+                        with torch.amp.autocast('cuda', dtype=amp_dtype):
                             out, router_logits = forward_with_router_logits(
                                 layer,
                                 inputs[j].unsqueeze(0),
@@ -483,7 +487,7 @@ def omniquant(
                                 
                                 # Forward pass - qlayer is FP32, use autocast for efficiency
                                 # Must call smooth_and_quant_temporary each iteration to recreate computation graph
-                                with torch.amp.autocast('cuda'):
+                                with torch.amp.autocast('cuda', dtype=amp_dtype):
                                     smooth_and_quant_temporary(qlayer, args, is_llama)
                                     _ = qlayer(
                                         quant_inps[j].unsqueeze(0),
@@ -559,7 +563,7 @@ def omniquant(
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
         if args.epochs > 0:
             with torch.no_grad():
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
                     for j in range(args.nsamples):
                         fp_inps[j] = qlayer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
                         if args.aug_loss:
@@ -621,7 +625,10 @@ def omniquant(
             
             # Default weight_decay=0 for optimizer (each group specifies its own)
             optimizer = torch.optim.AdamW(param_groups, weight_decay=0)
-            loss_scaler = utils.NativeScalerWithGradNormCount()
+            scaler_enabled = (not args.deactive_amp) and (amp_dtype == torch.float16)
+            loss_scaler = utils.NativeScalerWithGradNormCount(enabled=scaler_enabled)
+            if i == 0:
+                logger.info(f"[AMP] GradScaler enabled={scaler_enabled}")
             
             # Collect all trainable parameters for gradient clipping
             # Start with quantization parameters (LET/LWC)
@@ -775,7 +782,7 @@ def omniquant(
                 num_samples = min(args.nsamples, 8)
                 for j in range(num_samples):
                     # Use hook-based forward to get router logits
-                    with torch.amp.autocast('cuda'):
+                    with torch.amp.autocast('cuda', dtype=amp_dtype):
                         out, router_logits = forward_with_router_logits(
                             qlayer,
                             quant_inps[j].unsqueeze(0),
@@ -832,7 +839,10 @@ def omniquant(
             # Clean up temp_weight
             clear_temp_variable(qlayer)
         
-        qlayer.half() 
+        if is_qwen_model:
+            qlayer = qlayer.to(dtype=torch.bfloat16)
+        else:
+            qlayer.half()
         # real smooth and quantization
         smooth_and_quant_inplace(qlayer, args, is_llama)
         if args.epochs>0:

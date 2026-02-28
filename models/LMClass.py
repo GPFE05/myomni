@@ -26,7 +26,15 @@ class LMClass(BaseLM):
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False, legacy=False, trust_remote_code=True)
         # self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=config.torch_dtype)
-        self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu', torch_dtype=torch.float16, trust_remote_code=True)
+        model_key = f"{getattr(args, 'net', '')} {args.model}".lower()
+        model_dtype = torch.bfloat16 if "qwen" in model_key else torch.float16
+        self.model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            config=config,
+            device_map='cpu',
+            torch_dtype=model_dtype,
+            trust_remote_code=True
+        )
         self.seqlen = self.model.config.max_position_embeddings
         self.model.eval()
         self.vocab_size = self.tokenizer.vocab_size
@@ -93,7 +101,7 @@ class LMClass(BaseLM):
         dataset_logits = []
         for batch in inps:
             multi_logits = F.log_softmax(
-                self._model_call(batch), dim=-1
+                self._model_call(batch).float(), dim=-1
             ).cpu()  # [batch, padding_length, vocab]
             dataset_logits.append(multi_logits)
         return dataset_logits

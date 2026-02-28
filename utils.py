@@ -27,21 +27,30 @@ def ampscaler_get_grad_norm(parameters, norm_type: float = 2.0) -> torch.Tensor:
 class NativeScalerWithGradNormCount:
     state_dict_key = "amp_scaler"
 
-    def __init__(self):
-        self._scaler = torch.amp.GradScaler('cuda')
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self._scaler = torch.amp.GradScaler('cuda', enabled=enabled)
 
     def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True,retain_graph=False):
-        self._scaler.scale(loss).backward(create_graph=create_graph, retain_graph=retain_graph)
+        if self.enabled:
+            self._scaler.scale(loss).backward(create_graph=create_graph, retain_graph=retain_graph)
+        else:
+            loss.backward(create_graph=create_graph, retain_graph=retain_graph)
         if update_grad:
             if clip_grad is not None:
                 assert parameters is not None
-                self._scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
+                if self.enabled:
+                    self._scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
                 norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
             else:
-                self._scaler.unscale_(optimizer)
+                if self.enabled:
+                    self._scaler.unscale_(optimizer)
                 norm = ampscaler_get_grad_norm(parameters)
-            self._scaler.step(optimizer)
-            self._scaler.update()
+            if self.enabled:
+                self._scaler.step(optimizer)
+                self._scaler.update()
+            else:
+                optimizer.step()
         else:
             norm = None
         return norm

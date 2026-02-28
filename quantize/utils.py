@@ -8,9 +8,9 @@ from models.transformation import *
 
 
 @torch.no_grad()
-def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, dev, topk=20, logger=None):
+def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, dev, topk=20, logger=None, amp_dtype=torch.float16):
     """
-    Capture FP16 router labels for a single layer using pre-captured inputs.
+    Capture teacher router labels for a single layer using pre-captured inputs.
     This is more memory-efficient than processing the entire model at once.
     
     Args:
@@ -21,6 +21,7 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
         dev: Target device
         topk: Number of top experts to cache
         logger: Optional logger
+        amp_dtype: AMP dtype used during forward (e.g., torch.float16/torch.bfloat16)
     
     Returns:
         (values_tensor, indices_tensor) on GPU device
@@ -48,7 +49,7 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
     
     for j in range(nsamples):
         captured_data.clear()
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda', dtype=amp_dtype):
             _ = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)
         if captured_data:
             values, indices = captured_data[0]

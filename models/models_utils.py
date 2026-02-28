@@ -333,7 +333,7 @@ class BaseLM(LM):
 
             # self.model = self.model.to(self.device)
             multi_logits = F.log_softmax(
-                self._model_call(batched_inps), dim=-1
+                self._model_call(batched_inps).float(), dim=-1
             ).cpu()  # [batch, padding_length, vocab]
 
             # dataset_inps.append(batched_inps)

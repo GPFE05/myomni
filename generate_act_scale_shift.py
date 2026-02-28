@@ -97,7 +97,8 @@ def get_act_shifts(model, dataloader, num_samples=128):
 
 
 def build_model_and_tokenizer(model_name):
-    kwargs = {"torch_dtype": torch.float16, "device_map": "auto", "trust_remote_code": True}
+    model_dtype = torch.bfloat16 if "qwen" in model_name.lower() else torch.float16
+    kwargs = {"torch_dtype": model_dtype, "device_map": "auto", "trust_remote_code": True}
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
     return model, tokenizer

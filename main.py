@@ -167,7 +167,7 @@ def evaluate(lm, args, logger):
                     outputs = lm.model.transformer(batch)
                 hidden_states = outputs[0]
                 logits = lm.model.lm_head(hidden_states)
-                shift_logits = logits[:, :-1, :]
+                shift_logits = logits[:, :-1, :].float()
                 shift_labels = testenc[:, (i * lm.seqlen) : ((i + 1) * lm.seqlen)][
                     :, 1:
                 ].to(lm.model.lm_head.weight.device)
