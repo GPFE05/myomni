@@ -179,7 +179,7 @@ def omniquant(
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
-        # Qwen2MoE only supports LWC quantization, no DecoderLayer needed
+        # Qwen MoE models only support the MoE/LWC path here, no DecoderLayer wrapper is needed.
         layer_name_prefix = "model.layers"
     else:
         raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen now")
@@ -279,7 +279,7 @@ def omniquant(
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
         if "mixtral" in args.net.lower() or "qwen" in args.net.lower():  
-            # For MoE models (mixtral, qwen2moe), only LWC is supported
+            # For MoE models (Mixtral, Qwen MoE), only the LWC-style path is supported.
             # Simply replace Linear with QuantLinear, do not quantize router (gate)
             qlayer = copy.deepcopy(layer)
             
@@ -317,7 +317,7 @@ def omniquant(
         qlayer = qlayer.to(dev)
 
         # =================================================================
-        # Expert Shift Tracking for Qwen2-MoE
+        # Expert Shift Tracking for Qwen MoE
         # Flow: 
         #   1. Capture FP16 teacher labels from ORIGINAL layer
         #   2. Set quantization state on qlayer

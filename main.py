@@ -60,8 +60,22 @@ net_choices = [
     "falcon-7b",
     "mixtral-8x7b",
     "deepseek-moe-16b-base",
-    "Qwen1.5-MoE-A2.7B"
+    "Qwen1.5-MoE-A2.7B",
+    "Qwen3-30B-A3B"
 ]
+
+
+def get_no_split_module_classes(net_name):
+    classes = ["LlamaDecoderLayer", "QuantLlamaDecoderLayer", "MixtralDecoderLayer"]
+    net_name = (net_name or "").lower()
+
+    if "qwen" in net_name:
+        classes.extend([
+            "Qwen2MoeDecoderLayer",
+            "Qwen3MoeDecoderLayer",
+        ])
+
+    return classes
 
 
 @torch.no_grad()
@@ -104,10 +118,8 @@ def evaluate(lm, args, logger):
             lm.model.lm_head.to(output_device)
 
     elif getattr(args, 'parallelize', False):
-        # === 回答问题4：防止切分关键层 ===
-        # Qwen2MoeDecoderLayer 是 Qwen1.5-MoE 在 HF transformers 中的标准名称
-        # 加上它，accelerate 就会保证这一层完整地放在同一张卡上
-        no_split = ["LlamaDecoderLayer", "QuantLlamaDecoderLayer", "Qwen2MoeDecoderLayer", "MixtralDecoderLayer"]
+        # Prevent decoder layers from being split across devices when using accelerate.
+        no_split = get_no_split_module_classes(args.net)
 
         balanced_mem = get_balanced_memory(
             lm.model,
@@ -278,7 +290,7 @@ def evaluate(lm, args, logger):
     elif 'falcon' in args.model:
         model.transformer.word_embeddings = model.transformer.word_embeddings.cpu()
     else:
-        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen/deepseek now")
 
     # === [Added] WandB Visualization Logic ===
     if args.enable_wandb and len(results) > 0:
@@ -395,11 +407,20 @@ def main():
         choices=["eager", "sdpa", "flash_attention_2"],
         help="attention implementation that the model works with",
     )
-    parser.add_argument("--net", type=str, default=None, choices=net_choices)
+    parser.add_argument(
+        "--net",
+        type=str,
+        default=None,
+        help=(
+            "Model family or variant name. Known examples: "
+            + ", ".join(net_choices)
+            + ". New variants such as Qwen3 can also be passed directly."
+        ),
+    )
     parser.add_argument("--act-scales", type=str, default=None)
     parser.add_argument("--act-shifts", type=str, default=None)
     parser.add_argument("--train_shared_gate", default=False, action="store_true",
-                        help="Train shared_expert_gate layers during calibration (for Qwen2-MoE)")
+                        help="Train shared_expert_gate layers during calibration (only applies to Qwen MoE variants that expose shared_expert_gate)")
     parser.add_argument("--train_gate_lora", default=False, action="store_true",
                         help="Apply LoRA to mlp.gate (router) layers and train them (for MoE models)")
     parser.add_argument("--shared_gate_lr", type=float, default=1e-4,
@@ -408,9 +429,9 @@ def main():
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank for gate training")
     parser.add_argument("--lora_alpha", type=float, default=16, help="LoRA alpha (scaling factor) for gate training")
     
-    # Router Calibration arguments (for Qwen2-MoE)
+    # Router Calibration arguments (for Qwen MoE models)
     parser.add_argument("--calibrate_router", default=False, action="store_true",
-                        help="Enable Router Calibration using TopK-MSE loss for Qwen2-MoE")
+                        help="Enable Router Calibration using TopK-MSE loss for Qwen MoE models")
     parser.add_argument("--router_lr", type=float, default=1e-2,
                         help="Learning rate for router calibration (default 1e-2, higher than LWC)")
     parser.add_argument("--router_epochs", type=int, default=5,
