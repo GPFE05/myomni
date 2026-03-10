@@ -34,6 +34,18 @@ def call_layer_forward(layer, hidden_states, layer_kwargs=None, **extra_kwargs):
     )
 
 
+def extract_hidden_states(outputs):
+    if isinstance(outputs, torch.Tensor):
+        return outputs
+    if isinstance(outputs, (tuple, list)):
+        return outputs[0]
+    if hasattr(outputs, "last_hidden_state"):
+        return outputs.last_hidden_state
+    if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+        return outputs.hidden_states
+    return outputs[0]
+
+
 @torch.no_grad()
 def capture_router_labels_layerwise(layer, inps, dev, topk=20, logger=None, layer_kwargs=None):
     """
@@ -206,10 +218,7 @@ def forward_with_router_logits(layer, hidden_states, layer_kwargs=None, **kwargs
         handle.remove()
     
     # Extract hidden states
-    if isinstance(outputs, tuple):
-        hidden_states_out = outputs[0]
-    else:
-        hidden_states_out = outputs
+    hidden_states_out = extract_hidden_states(outputs)
     
     return hidden_states_out, captured.get('logits', None)
 
