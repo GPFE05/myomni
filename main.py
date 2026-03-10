@@ -61,7 +61,7 @@ net_choices = [
     "mixtral-8x7b",
     "deepseek-moe-16b-base",
     "Qwen1.5-MoE-A2.7B",
-    "Qwen3-30B-A3B"
+    "Qwen3-30B-A3B-Base"
 ]
 
 

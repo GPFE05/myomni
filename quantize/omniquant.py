@@ -17,7 +17,8 @@ from quantize.utils import (
     omni_state_dict, register_scales_and_zeros, smooth_and_quant_temporary,
     smooth_and_quant_inplace, clear_temp_variable, set_quant_state,
     capture_router_labels_layerwise, compute_expert_shift_detailed,
-    compute_topk_mse_loss, forward_with_router_logits, create_router_hook
+    compute_topk_mse_loss, forward_with_router_logits, create_router_hook,
+    call_layer_forward
 )
 
 
@@ -207,9 +208,10 @@ def omniquant(
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
             cache["i"] += 1
-            cache["attention_mask"] = kwargs["attention_mask"]
+            cache["layer_kwargs"] = dict(kwargs)
+            cache["attention_mask"] = kwargs.get("attention_mask")
             if self.is_llama:
-                cache["position_ids"] = kwargs["position_ids"]
+                cache["position_ids"] = kwargs.get("position_ids")
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -261,6 +263,7 @@ def omniquant(
         attention_mask_batch = None
 
     loss_func = torch.nn.MSELoss()
+    layer_kwargs = dict(cache.get("layer_kwargs", {}))
     if is_llama:
         position_ids = cache["position_ids"]
     else:
@@ -347,7 +350,7 @@ def omniquant(
             # ============================================================
             logger.info(f"[Expert Shift] Layer {i}: Capturing FP16 router labels (topk={k_loss})...")
             cached_router_labels = capture_router_labels_layerwise(
-                layer, fp_inps, attention_mask, position_ids, dev, topk=k_loss, logger=logger
+                layer, fp_inps, dev, topk=k_loss, logger=logger, layer_kwargs=layer_kwargs
             )
             
             if cached_router_labels is not None:
@@ -385,6 +388,7 @@ def omniquant(
                             out, router_logits = forward_with_router_logits(
                                 layer,
                                 inputs[j].unsqueeze(0),
+                                layer_kwargs=layer_kwargs,
                                 attention_mask=attention_mask,
                                 position_ids=position_ids
                             )
@@ -485,8 +489,10 @@ def omniquant(
                                 # Must call smooth_and_quant_temporary each iteration to recreate computation graph
                                 with torch.amp.autocast('cuda'):
                                     smooth_and_quant_temporary(qlayer, args, is_llama)
-                                    _ = qlayer(
+                                    _ = call_layer_forward(
+                                        qlayer,
                                         quant_inps[j].unsqueeze(0),
+                                        layer_kwargs=layer_kwargs,
                                         attention_mask=attention_mask,
                                         position_ids=position_ids
                                     )
@@ -561,9 +567,21 @@ def omniquant(
             with torch.no_grad():
                 with torch.amp.autocast('cuda'):
                     for j in range(args.nsamples):
-                        fp_inps[j] = qlayer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
+                        fp_inps[j] = call_layer_forward(
+                            qlayer,
+                            fp_inps[j].unsqueeze(0),
+                            layer_kwargs=layer_kwargs,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids
+                        )[0]
                         if args.aug_loss:
-                            fp_inps_2[j] = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
+                            fp_inps_2[j] = call_layer_forward(
+                                qlayer,
+                                quant_inps[j].unsqueeze(0),
+                                layer_kwargs=layer_kwargs,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids
+                            )[0]
         # init smooth parameters
         set_quant_state(qlayer, weight_quant=False, act_quant=True)  # weight will be manually quantized before forward
         qlayer.let = args.let
@@ -656,7 +674,13 @@ def omniquant(
                     # obtain output of quantization model
                     with traincast():
                         smooth_and_quant_temporary(qlayer, args, is_llama)
-                        quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
+                        quant_out = call_layer_forward(
+                            qlayer,
+                            quant_inps[index:index+args.batch_size,],
+                            layer_kwargs=layer_kwargs,
+                            attention_mask=attention_mask_batch,
+                            position_ids=position_ids
+                        )[0]
                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
                         if args.aug_loss:
                             loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
@@ -779,6 +803,7 @@ def omniquant(
                         out, router_logits = forward_with_router_logits(
                             qlayer,
                             quant_inps[j].unsqueeze(0),
+                            layer_kwargs=layer_kwargs,
                             attention_mask=attention_mask,
                             position_ids=position_ids
                         )
@@ -841,7 +866,13 @@ def omniquant(
                 # with torch.cuda.amp.autocast():
                 with traincast():
                     for j in range(args.nsamples):
-                        quant_inps[j] = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
+                        quant_inps[j] = call_layer_forward(
+                            qlayer,
+                            quant_inps[j].unsqueeze(0),
+                            layer_kwargs=layer_kwargs,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids
+                        )[0]
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
             omni_parameters[i] = omni_state_dict(qlayer)

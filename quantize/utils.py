@@ -1,3 +1,4 @@
+import inspect
 from collections import OrderedDict
 from quantize.int_linear import QuantLinear
 import torch
@@ -7,8 +8,34 @@ from quantize.int_matmul import QuantMatMul
 from models.transformation import *
 
 
+def get_layer_forward_kwargs(layer, layer_kwargs=None, **extra_kwargs):
+    merged_kwargs = {}
+    if layer_kwargs:
+        merged_kwargs.update(layer_kwargs)
+    for key, value in extra_kwargs.items():
+        if value is not None:
+            merged_kwargs[key] = value
+
+    signature = inspect.signature(layer.forward)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return merged_kwargs
+
+    return {
+        key: value
+        for key, value in merged_kwargs.items()
+        if value is not None and key in signature.parameters
+    }
+
+
+def call_layer_forward(layer, hidden_states, layer_kwargs=None, **extra_kwargs):
+    return layer(
+        hidden_states,
+        **get_layer_forward_kwargs(layer, layer_kwargs=layer_kwargs, **extra_kwargs)
+    )
+
+
 @torch.no_grad()
-def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, dev, topk=20, logger=None):
+def capture_router_labels_layerwise(layer, inps, dev, topk=20, logger=None, layer_kwargs=None):
     """
     Capture FP16 router labels for a single layer using pre-captured inputs.
     This is more memory-efficient than processing the entire model at once.
@@ -16,11 +43,10 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
     Args:
         layer: A single decoder layer (on device)
         inps: Input hidden states [nsamples, seqlen, hidden_size]
-        attention_mask: Attention mask tensor
-        position_ids: Position IDs tensor
         dev: Target device
         topk: Number of top experts to cache
         logger: Optional logger
+        layer_kwargs: Optional keyword arguments forwarded to layer.forward
     
     Returns:
         (values_tensor, indices_tensor) on GPU device
@@ -49,7 +75,7 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
     for j in range(nsamples):
         captured_data.clear()
         with torch.amp.autocast('cuda'):
-            _ = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)
+            _ = call_layer_forward(layer, inps[j].unsqueeze(0), layer_kwargs=layer_kwargs)
         if captured_data:
             values, indices = captured_data[0]
             # Ensure shape is [1, seqlen, topk] - reshape if needed
@@ -149,15 +175,14 @@ def compute_expert_shift_detailed(student_logits, teacher_indices, k_routing, de
 # =============================================================================
 # Task 3: Router Logits Capture via Simple Hook
 # =============================================================================
-def forward_with_router_logits(layer, hidden_states, attention_mask=None, position_ids=None, **kwargs):
+def forward_with_router_logits(layer, hidden_states, layer_kwargs=None, **kwargs):
     """
     Forward pass through a layer while capturing router logits via hook.
     
     Args:
         layer: The decoder layer (can be quantized or original)
         hidden_states: Input tensor
-        attention_mask: Attention mask
-        position_ids: Position IDs
+        layer_kwargs: Optional keyword arguments forwarded to layer.forward
         **kwargs: Additional arguments
     
     Returns:
@@ -174,12 +199,7 @@ def forward_with_router_logits(layer, hidden_states, attention_mask=None, positi
         handle = layer.mlp.gate.register_forward_hook(hook_fn)
     
     # Forward
-    outputs = layer(
-        hidden_states,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        **kwargs
-    )
+    outputs = call_layer_forward(layer, hidden_states, layer_kwargs=layer_kwargs, **kwargs)
     
     # Remove hook
     if handle is not None:
