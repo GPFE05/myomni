@@ -96,10 +96,17 @@ def get_act_shifts(model, dataloader, num_samples=128):
 
 
 
-def build_model_and_tokenizer(model_name):
+def build_model_and_tokenizer(model_name, trust_remote_code=False):
     kwargs = {"torch_dtype": torch.float16, "device_map": "auto"}
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=trust_remote_code,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        trust_remote_code=trust_remote_code,
+        **kwargs,
+    )
     return model, tokenizer
 
 def parse_args():
@@ -116,6 +123,12 @@ def parse_args():
     parser.add_argument('--num-samples', type=int, default=128)
     parser.add_argument('--seq-len', type=int, default=2048)
     parser.add_argument("--seed", type=int, default=2, help="Seed for sampling the calibration data.")
+    parser.add_argument(
+        '--trust-remote-code',
+        action='store_true',
+        dest='trust_remote_code',
+        help='allow Hugging Face repositories with custom modeling/tokenizer code',
+    )
     args = parser.parse_args()
     return args
 
@@ -123,13 +136,17 @@ def parse_args():
 @torch.no_grad()
 def main():
     args = parse_args()
-    model, tokenizer = build_model_and_tokenizer(args.model)
+    model, tokenizer = build_model_and_tokenizer(
+        args.model,
+        trust_remote_code=args.trust_remote_code,
+    )
     dataloader, _ = get_loaders(
     args.calib_dataset,
     nsamples=args.num_samples,
     seed=args.seed,
     model=args.model,
     seqlen=args.seq_len,
+    trust_remote_code=args.trust_remote_code,
     )
     
     args.net = args.model.split('/')[-1]

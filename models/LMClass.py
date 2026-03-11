@@ -18,15 +18,29 @@ class LMClass(BaseLM):
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = args.model
         self.batch_size_per_gpu = args.batch_size
+        self.trust_remote_code = args.trust_remote_code
 
         self.model_config = args.model
         config = AutoConfig.from_pretrained(
-            args.model, attn_implementation=args.attn_implementation
+            args.model,
+            attn_implementation=args.attn_implementation,
+            trust_remote_code=self.trust_remote_code,
         )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False,legacy=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            args.model,
+            use_fast=False,
+            legacy=False,
+            trust_remote_code=self.trust_remote_code,
+        )
         # self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=config.torch_dtype)
-        self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            config=config,
+            device_map='cpu',
+            torch_dtype=torch.float16,
+            trust_remote_code=self.trust_remote_code,
+        )
         self.seqlen = self.model.config.max_position_embeddings
         self.model.eval()
         self.vocab_size = self.tokenizer.vocab_size

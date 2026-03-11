@@ -1,6 +1,7 @@
 import os
 import sys
 import random
+import pickle
 import numpy as np
 from models.LMClass import LMClass
 import torch
@@ -47,6 +48,31 @@ net_choices = [
     "falcon-7b",
     "mixtral-8x7b"
 ]
+
+
+def load_local_torch_file(path, *, trusted=False):
+    try:
+        return torch.load(path, map_location="cpu")
+    except pickle.UnpicklingError:
+        if not trusted:
+            raise
+        return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def pack_testloader_for_cache(testloader):
+    input_ids = getattr(testloader, "input_ids", None)
+    if isinstance(input_ids, torch.Tensor):
+        return input_ids.cpu()
+    return testloader
+
+
+def unpack_testloader_from_cache(testloader):
+    if isinstance(testloader, torch.Tensor):
+        return testloader
+    input_ids = getattr(testloader, "input_ids", None)
+    if isinstance(input_ids, torch.Tensor):
+        return input_ids
+    return testloader
 
 
 @torch.no_grad()
@@ -96,7 +122,7 @@ def evaluate(lm, args, logger):
         for dataset in ["wikitext2", "c4"]:
             cache_testloader = f'{args.cache_dir}/testloader_{args.model_family}_{dataset}_all.cache'
             if os.path.exists(cache_testloader):
-                testloader = torch.load(cache_testloader)
+                testloader = load_local_torch_file(cache_testloader, trusted=True)
                 logger.info(f"load calibration from {cache_testloader}")
             else:
                 dataloader, testloader = get_loaders(
@@ -104,12 +130,10 @@ def evaluate(lm, args, logger):
                     seed=args.seed,
                     model=args.model,
                     seqlen=lm.seqlen,
+                    trust_remote_code=args.trust_remote_code,
                 )
-                torch.save(testloader, cache_testloader)
-            if "c4" in dataset:
-                testenc = testloader
-            else:
-                testenc = testloader.input_ids
+                torch.save(pack_testloader_for_cache(testloader), cache_testloader)
+            testenc = unpack_testloader_from_cache(testloader)
 
             nsamples = testenc.numel() // lm.seqlen
             use_cache = lm.model.config.use_cache
@@ -232,6 +256,11 @@ def main():
     parser.add_argument("--net", type=str, default=None, choices=net_choices)
     parser.add_argument("--act-scales", type=str, default=None)
     parser.add_argument("--act-shifts", type=str, default=None)
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help="allow Hugging Face repositories with custom modeling/tokenizer code",
+    )
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -326,7 +355,7 @@ def main():
         # load calibration dataset
         cache_dataloader = f'{args.cache_dir}/dataloader_{args.model_family}_{args.calib_dataset}_{args.nsamples}.cache'
         if os.path.exists(cache_dataloader):
-            dataloader = torch.load(cache_dataloader)
+            dataloader = load_local_torch_file(cache_dataloader, trusted=True)
             logger.info(f"load calibration from {cache_dataloader}")
         else:
             dataloader, _ = get_loaders(
@@ -335,13 +364,14 @@ def main():
                 seed=args.seed,
                 model=args.model,
                 seqlen=lm.seqlen,
+                trust_remote_code=args.trust_remote_code,
             )
             torch.save(dataloader, cache_dataloader)    
         act_scales = None
         act_shifts = None
         if args.let:
-            act_scales = torch.load(args.act_scales)
-            act_shifts = torch.load(args.act_shifts)
+            act_scales = load_local_torch_file(args.act_scales, trusted=True)
+            act_shifts = load_local_torch_file(args.act_shifts, trusted=True)
         omniquant(
             lm,
             args,

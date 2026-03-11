@@ -7,6 +7,7 @@ from quantize.int_linear import QuantLinear
 from contextlib import nullcontext
 import copy
 import math
+import pickle
 import utils
 import os
 import pdb
@@ -19,6 +20,15 @@ try:
     import auto_gptq.nn_modules.qlinear.qlinear_triton as qlinear_triton
 except:
     print("auto_gptq is required for real quantization")
+
+
+def load_local_torch_file(path, *, trusted=False):
+    try:
+        return torch.load(path, map_location="cpu")
+    except pickle.UnpicklingError:
+        if not trusted:
+            raise
+        return torch.load(path, map_location="cpu", weights_only=False)
 
 
 
@@ -183,7 +193,7 @@ def omniquant(
 
 
     if args.resume:
-        omni_parameters = torch.load(args.resume)
+        omni_parameters = load_local_torch_file(args.resume, trusted=True)
     else:
         omni_parameters = {}
 
