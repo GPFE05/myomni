@@ -18,7 +18,8 @@ from quantize.utils import (
     smooth_and_quant_inplace, clear_temp_variable, set_quant_state,
     capture_router_labels_layerwise, compute_expert_shift_detailed,
     compute_topk_mse_loss, forward_with_router_logits, create_router_hook,
-    call_layer_forward, extract_hidden_states
+    call_layer_forward, extract_hidden_states, forward_with_module_input,
+    set_stage_trainable_params, assert_tensors_on_same_device
 )
 
 
@@ -94,6 +95,42 @@ def add_new_module(name, original_module, added_module):
         setattr(mod_, levels[-1], added_module)
     else:
         setattr(original_module, name, added_module)     
+
+
+def stage_build_units(total_layers):
+    """构建显式阶段序列：A0 -> Ai* -> Z。"""
+    units = [("A0", 0)]
+    for idx in range(total_layers - 1):
+        units.append(("Ai", idx))
+    units.append(("Z", total_layers - 1))
+    return units
+
+
+def stage_is_attn_linear(module_name):
+    return module_name.startswith("self_attn.") and module_name.split(".")[-1] in {"q_proj", "k_proj", "v_proj", "o_proj"}
+
+
+def stage_is_router_gate(module_name):
+    return module_name.endswith(".gate") or module_name == "gate"
+
+
+def stage_is_shared_expert_gate(module_name):
+    return module_name.endswith("shared_expert_gate")
+
+
+def stage_is_moe_linear(module_name):
+    return module_name.startswith("mlp.")
+
+
+def stage_should_quantize_linear(stage_name, module_name):
+    """阶段化线性层量化规则。"""
+    if stage_name == "A0":
+        return stage_is_attn_linear(module_name)
+    if stage_name == "Ai":
+        return stage_is_moe_linear(module_name) and (not stage_is_attn_linear(module_name))
+    if stage_name == "Z":
+        return stage_is_moe_linear(module_name) and (not stage_is_attn_linear(module_name))
+    return True
 
 def omniquant(
     lm,
@@ -276,11 +313,87 @@ def omniquant(
     else:
         omni_parameters = {}
 
-    
-    
-    for i in range(len(layers)):
-        logger.info(f"=== Start quantize layer {i} ===")
+    if "qwen" not in args.net.lower():
+        raise ValueError("This staged MoE schedule currently supports Qwen MoE only.")
+
+    logger.info("[Stage] Schedule initialized: A0 -> (Ri+Mi)* -> Z")
+
+    # ======================== 阶段辅助函数（中文详细注释） ========================
+    # 说明：当前代码仍基于“逐层主循环”演进，为了逐步收敛到 A0/(Ri+Mi)/Z，
+    # 我们先把“阶段语义”显式化，后续再进一步抽离为独立 dispatcher。
+    def _build_stage_units(total_layers):
+        return stage_build_units(total_layers)
+
+    def _is_attn_linear(module_name):
+        return stage_is_attn_linear(module_name)
+
+    def _is_router_gate(module_name):
+        return stage_is_router_gate(module_name)
+
+    def _is_shared_expert_gate(module_name):
+        return stage_is_shared_expert_gate(module_name)
+
+    def _is_moe_related_linear(module_name):
+        return stage_is_moe_linear(module_name)
+
+    def _should_quantize_linear_for_stage(stage_name, module_name):
+        return stage_should_quantize_linear(stage_name, module_name)
+
+    stage_units = _build_stage_units(len(layers))
+
+    # 保存每层的 FP16 teacher 快照，保证 Ri 与 expert shift 标签不依赖已量化学生层。
+    # 说明：
+    # 1) 第 0 层在进入 A0 前就会缓存；
+    # 2) 第 i+1 层会在 Ai(i) 时作为 next_layer_fp 首次出现并缓存；
+    # 3) 后续任意阶段都优先使用该快照生成 teacher 标签。
+    fp_teacher_layers = {}
+
+    for stage_name, i in stage_units:
+        layer_stage = stage_name
+        stage_train_enabled = args.epochs > 0
+        should_roll_buffers = stage_train_enabled and layer_stage == "Ai"
+        stage_gate_train_enabled = layer_stage in {"Ai", "Z"}
+
+        if layer_stage == "A0":
+            logger.info(f"=== [Stage A0] Start stage on layer {i} (attention-only) ===")
+        elif layer_stage == "Z":
+            logger.info(f"=== [Stage Z] Start quantize layer {i} (last-moe-only) ===")
+        else:
+            logger.info(f"=== [Stage A{i}] Start quantize layer {i} (Ri+Mi unit) ===")
+
         layer = layers[i].to(dev)
+        if i not in fp_teacher_layers:
+            fp_teacher_layers[i] = copy.deepcopy(layer).cpu()
+
+        teacher_layer = fp_teacher_layers[i].to(dev)
+        teacher_layer.eval()
+        for p in teacher_layer.parameters():
+            p.requires_grad = False
+
+        next_layer_fp = None
+        next_layer_student = None
+        if layer_stage == "Ai" and i < len(layers) - 1:
+            next_layer_fp = layers[i + 1].to(dev)
+            if (i + 1) not in fp_teacher_layers:
+                fp_teacher_layers[i + 1] = copy.deepcopy(next_layer_fp).cpu()
+            next_layer_fp.eval()
+            for p in next_layer_fp.parameters():
+                p.requires_grad = False
+            logger.info(f"[Device] Layer {i} and Layer {i+1} moved to {dev} for Mi cross-layer path.")
+
+            # ======================== 中文详细注释 ========================
+            # Ai 阶段除了训练当前层 router+moe，还需要把“下一层 attention”纳入可训练分支。
+            # 这里构造 next_layer_student：
+            # 1) 以 next_layer_fp 为模板复制；
+            # 2) 仅将 self_attn 的 q/k/v/o 线性替换为 QuantLinear；
+            # 3) 训练时通过 next_layer_student 在 post_attention_layernorm 输入处与 FP16 teacher 对齐。
+            next_layer_student = copy.deepcopy(next_layer_fp)
+            for n_name, n_module in next_layer_student.named_modules():
+                if isinstance(n_module, torch.nn.Linear) and _is_attn_linear(n_name):
+                    n_weight_params = args.attn_weight_quant_params if args.attn_weight_quant_params is not None else args.weight_quant_params
+                    n_quantlinear = QuantLinear(n_module, n_weight_params, args.act_quant_params)
+                    add_new_module(n_name, next_layer_student, n_quantlinear)
+            next_layer_student = next_layer_student.to(dev)
         if "mixtral" in args.net.lower() or "qwen" in args.net.lower():  
             # For MoE models (Mixtral, Qwen MoE), only the LWC-style path is supported.
             # Simply replace Linear with QuantLinear, do not quantize router (gate)
@@ -289,29 +402,33 @@ def omniquant(
             for name, module in qlayer.named_modules():
                 if isinstance(module, torch.nn.Linear):
                     # Target 1: Shared Expert Gate - name ends with "shared_expert_gate"
-                    is_shared_expert_gate = name.endswith("shared_expert_gate")
+                    is_shared_expert_gate = _is_shared_expert_gate(name)
                     
                     # Target 2: Router Gate - name ends with ".gate" (NOT "gate_proj")
                     # e.g., "mlp.gate" is router, but "mlp.experts.0.gate_proj" is NOT
-                    is_router_gate = name.endswith(".gate") or name == "gate"
+                    is_router_gate = _is_router_gate(name)
                     
                     if is_shared_expert_gate:
-                        if train_shared_gate:
+                        if train_shared_gate and stage_gate_train_enabled:
                             # Keep as nn.Linear but make trainable
                             module.weight.requires_grad = True
                             if module.bias is not None:
                                 module.bias.requires_grad = True
                         # else: skip, keep as frozen nn.Linear (default behavior)
                     elif is_router_gate:
-                        if train_gate_lora:
+                        if train_gate_lora and stage_gate_train_enabled:
                             # Replace with LoraLinear wrapper (use layer index as seed for reproducibility)
                             lora_linear = LoraLinear(module, r=lora_r, alpha=lora_alpha, seed=args.seed + i)
                             add_new_module(name, qlayer, lora_linear)
                         # else: skip, keep as frozen nn.Linear (default behavior)
                     else:
+                        if not _should_quantize_linear_for_stage(layer_stage, name):
+                            # 阶段过滤：例如 Z 阶段不应再碰最后层 attention 线性层。
+                            continue
+
                         # Target 3: All other linear layers (including gate_proj)
                         # Replace with QuantLinear
-                        is_attn_linear = name.startswith("self_attn.") and name.split(".")[-1] in {"q_proj", "k_proj", "v_proj", "o_proj"}
+                        is_attn_linear = _is_attn_linear(name)
                         weight_params = args.attn_weight_quant_params if (is_attn_linear and args.attn_weight_quant_params is not None) else args.weight_quant_params
                         quantlinear = QuantLinear(module, weight_params, args.act_quant_params)
                         add_new_module(name, qlayer, quantlinear)    
@@ -331,11 +448,15 @@ def omniquant(
         #   7. Compute Post-LWC Expert Shift
         # =================================================================
         is_qwen_moe = "qwen" in args.net.lower()
+        # Ri 只在 Ai 阶段可选执行；A0 和 Z 默认跳过。
+        do_router_calibration = calibrate_router and layer_stage == "Ai"
         cached_router_labels = None
         pre_lwc_shift = None
         post_calib_shift = None
         
-        if is_qwen_moe:
+        run_router_related_stages = layer_stage in {"Ai", "Z"}
+
+        if is_qwen_moe and run_router_related_stages:
             logger.info(f"[Expert Shift] Layer {i}: Starting expert shift tracking...")
             
             # Convert qlayer to FP32 for stable computation (same as LWC training)
@@ -349,8 +470,9 @@ def omniquant(
             # Phase A: Capture FP16 router labels from ORIGINAL layer
             # ============================================================
             logger.info(f"[Expert Shift] Layer {i}: Capturing FP16 router labels (topk={k_loss})...")
+            logger.info(f"[Expert Shift] Layer {i}: teacher_source=fp16_teacher")
             cached_router_labels = capture_router_labels_layerwise(
-                layer, fp_inps, dev, topk=k_loss, logger=logger, layer_kwargs=layer_kwargs
+                teacher_layer, fp_inps, dev, topk=k_loss, logger=logger, layer_kwargs=layer_kwargs
             )
             
             if cached_router_labels is not None:
@@ -373,11 +495,16 @@ def omniquant(
                 smooth_and_quant_temporary(qlayer, args, is_llama)
                 
                 # Helper function to compute expert shift (temp_weight already set)
-                def compute_shift_metrics(layer, inputs, teacher_idx, num_samples=8, desc=""):
+                def compute_shift_metrics(layer, inputs, teacher_idx, num_samples=None, desc=""):
                     """
                     Compute expert shift metrics using hook mechanism.
                     Assumes temp_weight is already set on the layer.
                     """
+                    # 默认走全量样本统计，和你确认的“expert shift 默认全量”保持一致。
+                    # 仅当调用方显式传入 num_samples 时，才会降采样。
+                    if num_samples is None:
+                        num_samples = inputs.shape[0]
+
                     shift_any_sum = 0.0
                     shift_half_sum = 0.0
                     shift_all_sum = 0.0
@@ -416,7 +543,7 @@ def omniquant(
                 with torch.no_grad():
                     pre_shift_any, pre_shift_half, pre_shift_all = compute_shift_metrics(
                         qlayer, quant_inps, teacher_indices, 
-                        num_samples=8, desc="Pre-LWC"
+                        num_samples=args.nsamples, desc="Pre-LWC"
                     )
                     logger.info(f"[Expert Shift] Layer {i}: Pre-LWC Expert Shift (Quantized vs FP) - Any: {pre_shift_any:.4f}, Half: {pre_shift_half:.4f}, All: {pre_shift_all:.4f}")
                     pre_lwc_shift = (pre_shift_any, pre_shift_half, pre_shift_all)
@@ -428,45 +555,31 @@ def omniquant(
                 # Goal: Train router to mimic FP16 expert selection UNDER QUANTIZED CONDITIONS
                 # - Keep quantization enabled so router sees quantized hidden states
                 # - temp_weight is already set from Phase B, no need to recreate
-                if calibrate_router:
+                if do_router_calibration:
                     logger.info(f"[Router Calibration] Layer {i}: Router calibration training (epochs={router_epochs}, lr={router_lr})...")
-                
-                    # Freeze ALL parameters except router gate
-                    saved_requires_grad = {}
-                    for name, param in qlayer.named_parameters():
-                        saved_requires_grad[name] = param.requires_grad
-                        param.requires_grad = False
-                    
-                    # Enable gradient only for router gate (directly on qlayer, not wrapped)
-                    # Support both nn.Linear and LoraLinear (when train_gate_lora is enabled)
+                    logger.info(f"[Router Calibration] Layer {i}: teacher_source=fp16_teacher")
+
+                    # ======================== 关键修正（中文详细注释） ========================
+                    # 这里先保存当前 requires_grad 状态，Ri 结束后需要完整恢复，
+                    # 以保证后续 Mi 阶段（LWC/LoRA/shared_gate）不受污染。
+                    saved_requires_grad = {
+                        name: param.requires_grad for name, param in qlayer.named_parameters()
+                    }
+
+                    # 通过 stage-aware 白名单直接切换到 Ri：
+                    # - 仅允许 router 主权重/偏置参与训练
+                    # - 明确禁止 LoRA A/B、LET/LWC、shared gate 等参数更新
+                    ri_named_params = set_stage_trainable_params(qlayer, stage="ri")
+
+                    # 将白名单参数转为优化器参数列表，并做去重。
                     router_gate_params = []
                     seen_params = set()
-                    router_gate_module = None
-                    for name, module in qlayer.named_modules():
-                        if name.endswith("mlp.gate"):
-                            router_gate_module = module
-                            if isinstance(module, LoraLinear):
-                                # For LoraLinear: train the original weight only, not LoRA matrices
-                                # Temporarily enable gradient for the frozen weight
-                                if id(module.weight) not in seen_params:
-                                    module.weight.requires_grad = True
-                                    router_gate_params.append(module.weight)
-                                    seen_params.add(id(module.weight))
-                                    if module.bias is not None and id(module.bias) not in seen_params:
-                                        module.bias.requires_grad = True
-                                        router_gate_params.append(module.bias)
-                                        seen_params.add(id(module.bias))
-                                    logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name} (LoraLinear.weight)")
-                            elif isinstance(module, nn.Linear):
-                                if id(module.weight) not in seen_params:
-                                    module.weight.requires_grad = True
-                                    router_gate_params.append(module.weight)
-                                    seen_params.add(id(module.weight))
-                                    if module.bias is not None and id(module.bias) not in seen_params:
-                                        module.bias.requires_grad = True
-                                        router_gate_params.append(module.bias)
-                                        seen_params.add(id(module.bias))
-                                    logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name} (nn.Linear)")
+                    for p_name, p in ri_named_params:
+                        if id(p) in seen_params:
+                            continue
+                        seen_params.add(id(p))
+                        router_gate_params.append(p)
+                        logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {p_name}")
                     
                     if router_gate_params:
                         logger.info(f"[Router Calibration] Layer {i}: {len(router_gate_params)} unique parameters to optimize")
@@ -536,7 +649,7 @@ def omniquant(
                         hook_handle.remove()
                         del router_optimizer
                     
-                    # Restore requires_grad states
+                    # 恢复进入 Ri 之前的 requires_grad，确保阶段隔离。
                     for name, param in qlayer.named_parameters():
                         if name in saved_requires_grad:
                             param.requires_grad = saved_requires_grad[name]
@@ -548,7 +661,7 @@ def omniquant(
                     with torch.no_grad():
                         post_shift_any, post_shift_half, post_shift_all = compute_shift_metrics(
                             qlayer, quant_inps, teacher_indices, 
-                            num_samples=8, desc=""
+                            num_samples=args.nsamples, desc=""
                         )
                         logger.info(f"[Router Calibration] Layer {i}: Post-Calib Expert Shift - Any: {post_shift_any:.4f}, Half: {post_shift_half:.4f}, All: {post_shift_all:.4f}")
                         logger.info(f"[Router Calibration] Layer {i}: Router Calib Improvement - Any: {pre_shift_any - post_shift_any:.4f}, Half: {pre_shift_half - post_shift_half:.4f}, All: {pre_shift_all - post_shift_all:.4f}")
@@ -561,27 +674,81 @@ def omniquant(
             else:
                 logger.warning(f"[Expert Shift] Layer {i}: No router gate found, skipping expert shift tracking.")
         
-        # obtain output of full-precision model
+        # ======================== Mi Teacher 构建（中文详细注释） ========================
+        # 这里不再使用“整层最终输出”作为监督，而是使用 next block 中的中间锚点：
+        #   layer i+1 的 post_attention_layernorm 输入。
+        # 这个位置严格对应 Qwen3 forward 里的：
+        #   hidden_states = residual + self_attn(...)
+        #   residual = hidden_states
+        #   hidden_states = post_attention_layernorm(hidden_states)
+        # 即：我们监督的是 attention 残差相加后的流（进入 post_attention_layernorm 之前）。
+        # 这样可以避免监督时机过早（比如仅抓 self_attn 原始输出）导致的语义偏差。
+        use_next_attn_loss = is_qwen_moe and (next_layer_fp is not None) and (layer_stage == "Ai")
+        teacher_next_attn_targets = None
+        stage_fp_targets = fp_inps
+        stage_fp_targets_2 = fp_inps_2
+        if layer_stage == "A0" and stage_train_enabled:
+            # A0 uses local targets only; global rolling buffers should not advance here.
+            stage_fp_targets = torch.zeros_like(fp_inps)
+            if args.aug_loss:
+                stage_fp_targets_2 = torch.zeros_like(fp_inps_2)
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
-        if args.epochs > 0:
+        if stage_train_enabled:
+            if use_next_attn_loss:
+                teacher_next_attn_targets = torch.zeros_like(fp_inps)
+                logger.info(f"[Mi] Layer {i}: teacher_source=fp16_teacher, loss_anchor=layer_{i+1}.post_attention_layernorm.input")
+
             with torch.no_grad():
                 with torch.amp.autocast('cuda'):
                     for j in range(args.nsamples):
-                        fp_inps[j] = extract_hidden_states(call_layer_forward(
-                            qlayer,
+                        fp_layer_out = extract_hidden_states(call_layer_forward(
+                            teacher_layer,
                             fp_inps[j].unsqueeze(0),
                             layer_kwargs=layer_kwargs,
                             attention_mask=attention_mask,
                             position_ids=position_ids
                         ))
+                        if layer_stage == "A0":
+                            stage_fp_targets[j] = fp_layer_out
+                        else:
+                            fp_inps[j] = fp_layer_out
+
+                        if use_next_attn_loss:
+                            # 设备一致性检查：teacher 目标张量和 next block 参数必须同设备。
+                            # 否则会触发隐式拷贝或直接报错，训练过程不稳定。
+                            assert_tensors_on_same_device(
+                                {
+                                    "fp_layer_out": fp_layer_out,
+                                    "next_layer_weight": next(iter(next_layer_fp.parameters())).data,
+                                },
+                                logger=logger,
+                                context=f"teacher-next-attn-layer-{i}",
+                            )
+                            # 通过 pre-hook 抓取 post_attention_layernorm 的输入，
+                            # 保证 teacher 标签来自“attention残差相加之后”的精确时机。
+                            _, teacher_attn_out = forward_with_module_input(
+                                next_layer_fp,
+                                fp_layer_out,
+                                module_path="post_attention_layernorm",
+                                layer_kwargs=layer_kwargs,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                detach_input=True,
+                            )
+                            teacher_next_attn_targets[j] = teacher_attn_out.squeeze(0).to(teacher_next_attn_targets.dtype)
+
                         if args.aug_loss:
-                            fp_inps_2[j] = extract_hidden_states(call_layer_forward(
-                                qlayer,
+                            fp_aug_out = extract_hidden_states(call_layer_forward(
+                                teacher_layer,
                                 quant_inps[j].unsqueeze(0),
                                 layer_kwargs=layer_kwargs,
                                 attention_mask=attention_mask,
                                 position_ids=position_ids
                             ))
+                            if layer_stage == "A0":
+                                stage_fp_targets_2[j] = fp_aug_out
+                            else:
+                                fp_inps_2[j] = fp_aug_out
         # init smooth parameters
         set_quant_state(qlayer, weight_quant=False, act_quant=True)  # weight will be manually quantized before forward
         qlayer.let = args.let
@@ -609,9 +776,32 @@ def omniquant(
             qlayer.load_state_dict(omni_parameters[i], strict=False)
         
 
-        if args.epochs > 0:
+        if stage_train_enabled:
             with torch.no_grad():
                 qlayer.float()      # required for AMP training
+                if next_layer_student is not None:
+                    next_layer_student.float()
+
+            # Mi stage parameter whitelist: LET/LWC + optional shared gate + optional LoRA.
+            set_stage_trainable_params(
+                qlayer,
+                stage="mi",
+                use_shift=use_shift,
+                train_shared_gate=(train_shared_gate and stage_gate_train_enabled),
+                train_gate_lora=(train_gate_lora and stage_gate_train_enabled),
+            )
+
+            if next_layer_student is not None:
+                # 下一层 attention 分支仅训练其量化参数（主要是 LWC 的 bound_factor）。
+                # 这里不引入 shared_gate / LoRA，避免跨层参数语义污染。
+                set_stage_trainable_params(
+                    next_layer_student,
+                    stage="mi",
+                    use_shift=False,
+                    train_shared_gate=False,
+                    train_gate_lora=False,
+                )
+
             # create optimizer with parameter groups
             # LET/LWC parameters use weight_decay=0 (fixed, not controlled by args.wd)
             param_groups = [
@@ -620,7 +810,7 @@ def omniquant(
             ]
             
             # Add shared_expert_gate parameters if training is enabled (uses args.wd)
-            if train_shared_gate:
+            if train_shared_gate and stage_gate_train_enabled:
                 shared_gate_params = []
                 for name, module in qlayer.named_modules():
                     if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
@@ -629,13 +819,19 @@ def omniquant(
                     param_groups.append({"params": shared_gate_params, "lr": shared_gate_lr, "weight_decay": args.wd})
             
             # Add LoRA parameters if training is enabled (uses args.wd)
-            if train_gate_lora:
+            if train_gate_lora and stage_gate_train_enabled:
                 lora_params = []
                 for name, module in qlayer.named_modules():
                     if isinstance(module, LoraLinear):
                         lora_params.extend([module.lora_A, module.lora_B])
                 if lora_params:
                     param_groups.append({"params": lora_params, "lr": gate_lora_lr, "weight_decay": args.wd})
+
+            # 将 next-attn 分支的量化参数加入优化器。
+            if next_layer_student is not None:
+                next_attn_params = list(get_omni_parameters(next_layer_student, use_shift=False))
+                if next_attn_params:
+                    param_groups.append({"params": next_attn_params, "lr": args.lwc_lr, "weight_decay": 0})
             
             # Default weight_decay=0 for optimizer (each group specifies its own)
             optimizer = torch.optim.AdamW(param_groups, weight_decay=0)
@@ -646,24 +842,27 @@ def omniquant(
             clip_parameters = list(get_omni_parameters(qlayer, use_shift))
             
             # Add shared_expert_gate parameters if training is enabled
-            if train_shared_gate:
+            if train_shared_gate and stage_gate_train_enabled:
                 for name, module in qlayer.named_modules():
                     if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
                         clip_parameters.extend([p for p in module.parameters() if p.requires_grad])
             
             # Add LoRA parameters if training is enabled
-            if train_gate_lora:
+            if train_gate_lora and stage_gate_train_enabled:
                 for name, module in qlayer.named_modules():
                     if isinstance(module, LoraLinear):
                         clip_parameters.extend([module.lora_A, module.lora_B])
+
+            if next_layer_student is not None:
+                clip_parameters.extend(list(get_omni_parameters(next_layer_student, use_shift=False)))
             
             # Log training configuration once per block (first layer only)
             if i == 0:
-                if train_shared_gate:
+                if train_shared_gate and stage_gate_train_enabled:
                     logger.info(f"[Gate Training] shared_expert_gate training ENABLED with lr={shared_gate_lr}")
-                if train_gate_lora:
+                if train_gate_lora and stage_gate_train_enabled:
                     logger.info(f"[Gate Training] router gate LoRA training ENABLED with r={lora_r}, alpha={lora_alpha}, lr={gate_lora_lr}")
-                if not train_shared_gate and not train_gate_lora:
+                if not (train_shared_gate and stage_gate_train_enabled) and not (train_gate_lora and stage_gate_train_enabled):
                     logger.info("[Gate Training] All gate training DISABLED (default behavior)")
             
             for epochs in range(args.epochs):
@@ -681,9 +880,38 @@ def omniquant(
                             attention_mask=attention_mask_batch,
                             position_ids=position_ids
                         ))
-                        loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
-                        if args.aug_loss:
-                            loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
+                        if use_next_attn_loss:
+                            # Student 分支同样在完全一致的锚点抓取，
+                            # 保证 teacher/student 对齐到同一语义位置。
+                            assert_tensors_on_same_device(
+                                {
+                                    "quant_out": quant_out,
+                                    "teacher_next_attn_targets": teacher_next_attn_targets[index:index+args.batch_size,],
+                                },
+                                logger=logger,
+                                context=f"mi-next-attn-loss-layer-{i}",
+                            )
+                            if next_layer_student is not None:
+                                # 下一层 attention 学生分支同样需要临时量化权重。
+                                smooth_and_quant_temporary(next_layer_student, args, is_llama)
+
+                            _, student_next_attn_out = forward_with_module_input(
+                                next_layer_student if next_layer_student is not None else next_layer_fp,
+                                quant_out,
+                                module_path="post_attention_layernorm",
+                                layer_kwargs=layer_kwargs,
+                                attention_mask=attention_mask_batch,
+                                position_ids=position_ids,
+                            )
+                            loss = loss_func(
+                                teacher_next_attn_targets[index:index+args.batch_size,],
+                                student_next_attn_out,
+                            )
+                        else:
+                            loss = loss_func(stage_fp_targets[index:index+args.batch_size,], quant_out)
+
+                        if args.aug_loss and not use_next_attn_loss:
+                            loss += loss_func(stage_fp_targets_2[index:index+args.batch_size,], quant_out)
                     if not math.isfinite(loss.item()):
                         logger.info("Loss is NAN, stopping training")
                         pdb.set_trace()
@@ -702,7 +930,7 @@ def omniquant(
                 shared_gate_grad_norm = 0.0
                 lora_grad_norm = 0.0
                 
-                if train_shared_gate:
+                if train_shared_gate and stage_gate_train_enabled:
                     for name, module in qlayer.named_modules():
                         if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
                             if module.weight.grad is not None:
@@ -710,7 +938,7 @@ def omniquant(
                     shared_gate_grad_norm = shared_gate_grad_norm ** 0.5
                     gate_grad_info += f" shared_gate_grad:{shared_gate_grad_norm:.2e}"
                 
-                if train_gate_lora:
+                if train_gate_lora and stage_gate_train_enabled:
                     for name, module in qlayer.named_modules():
                         if isinstance(module, LoraLinear):
                             if module.lora_A.grad is not None:
@@ -720,7 +948,11 @@ def omniquant(
                     lora_grad_norm = lora_grad_norm ** 0.5
                     gate_grad_info += f" lora_grad:{lora_grad_norm:.2e}"
                 
-                logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean}{gate_grad_info} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
+                logger.info(
+                    f"stage {layer_stage} layer {i} iter {epochs} "
+                    f"loss:{loss_mean} norm:{norm_mean}{gate_grad_info} "
+                    f"max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} "
+                )
                 final_loss = loss_mean.item()  # always update; after loop ends this holds last layer's last epoch loss
                 
                 # WandB logging: Log metrics with strict naming schema for Router Collapse detection
@@ -756,9 +988,9 @@ def omniquant(
                     }
                     
                     # Add gradient norms for Router Collapse detection
-                    if train_shared_gate:
+                    if train_shared_gate and stage_gate_train_enabled:
                         wandb_metrics["grad/shared_expert_norm"] = shared_gate_grad_norm
-                    if train_gate_lora:
+                    if train_gate_lora and stage_gate_train_enabled:
                         wandb_metrics["grad/router_lora_norm"] = lora_grad_norm
                     
                     # Add learning rates for hyperparameter tracking
@@ -772,10 +1004,12 @@ def omniquant(
                     wandb.log(wandb_metrics, step=global_step)
                     global_step += 1
             clear_temp_variable(qlayer)
+            if next_layer_student is not None:
+                clear_temp_variable(next_layer_student)
             del optimizer
             
             # Merge LoRA weights back into original Linear layers after training
-            if train_gate_lora:
+            if train_gate_lora and stage_gate_train_enabled:
                 for name, module in list(qlayer.named_modules()):
                     if isinstance(module, LoraLinear):
                         merged_linear = module.merge()
@@ -796,7 +1030,7 @@ def omniquant(
                 post_lwc_shift_any_sum = 0.0
                 post_lwc_shift_half_sum = 0.0
                 post_lwc_shift_all_sum = 0.0
-                num_samples = min(args.nsamples, 8)
+                num_samples = args.nsamples
                 for j in range(num_samples):
                     # Use hook-based forward to get router logits
                     with torch.amp.autocast('cuda'):
@@ -862,17 +1096,18 @@ def omniquant(
         smooth_and_quant_inplace(qlayer, args, is_llama)
         if args.epochs>0:
             # update input of quantization model
-            with torch.no_grad():
-                # with torch.cuda.amp.autocast():
-                with traincast():
-                    for j in range(args.nsamples):
-                        quant_inps[j] = extract_hidden_states(call_layer_forward(
-                            qlayer,
-                            quant_inps[j].unsqueeze(0),
-                            layer_kwargs=layer_kwargs,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids
-                        ))
+            if should_roll_buffers:
+                with torch.no_grad():
+                    # with torch.cuda.amp.autocast():
+                    with traincast():
+                        for j in range(args.nsamples):
+                            quant_inps[j] = extract_hidden_states(call_layer_forward(
+                                qlayer,
+                                quant_inps[j].unsqueeze(0),
+                                layer_kwargs=layer_kwargs,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids
+                            ))
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
             omni_parameters[i] = omni_state_dict(qlayer)
@@ -880,6 +1115,18 @@ def omniquant(
         else:
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
+
+        # Keep model body on CPU and only pin two active blocks on GPU.
+        if next_layer_fp is not None:
+            if next_layer_student is not None:
+                # 将训练后的 next-attn 学生分支写回下一层，供后续阶段继续使用。
+                register_scales_and_zeros(next_layer_student)
+                layers[i + 1] = next_layer_student.to("cpu")
+                del next_layer_student
+            else:
+                layers[i + 1] = next_layer_fp.to("cpu")
+            del next_layer_fp
+
         if args.real_quant:
             assert args.wbits in [2,3,4] and args.abits >= 16   # only support weight-only quantization
             named_linears = get_named_linears(qlayer)
@@ -899,6 +1146,10 @@ def omniquant(
                 print(f"pack quantized {name} finished")
                 del module        
         del layer
+
+        # teacher 快照用完后立即回迁 CPU，避免多层 teacher 常驻 GPU 导致显存累计。
+        fp_teacher_layers[i] = teacher_layer.to("cpu")
+        del teacher_layer
         torch.cuda.empty_cache()
 
     del inps

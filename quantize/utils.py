@@ -46,6 +46,60 @@ def extract_hidden_states(outputs):
     return outputs[0]
 
 
+def extract_module_output(outputs):
+    """Extract primary tensor output from a module forward return value."""
+    if isinstance(outputs, torch.Tensor):
+        return outputs
+    if isinstance(outputs, (tuple, list)):
+        return outputs[0]
+    return extract_hidden_states(outputs)
+
+
+def get_module_by_path(root_module, module_path):
+    """Resolve nested module by dotted path (supports integer indices)."""
+    current = root_module
+    for part in module_path.split("."):
+        if part.isdigit():
+            current = current[int(part)]
+        else:
+            current = getattr(current, part)
+    return current
+
+
+def forward_with_module_input(layer, hidden_states, module_path, layer_kwargs=None, detach_input=False, **kwargs):
+    """
+    Forward pass through a layer while capturing an intermediate module input.
+
+    Returns:
+        (layer_hidden_states, captured_module_input)
+    """
+    # 中文说明：
+    # 1) 我们在目标模块上注册 forward_pre_hook，抓取“进入该模块之前”的张量；
+    # 2) 这个时机非常关键，可用于对齐像 Qwen3 这类“残差相加后再进norm”的监督锚点；
+    # 3) detach_input=True 用于 teacher 标签采集，避免无意义的梯度图构建。
+    captured = {}
+    target_module = get_module_by_path(layer, module_path)
+
+    def pre_hook_fn(module, inputs):
+        if not inputs:
+            return
+        inp = inputs[0]
+        if torch.is_tensor(inp):
+            captured["input"] = inp.detach() if detach_input else inp
+
+    # 使用 pre_hook 而不是 forward_hook：
+    # pre_hook 捕获的是模块输入（例如 post_attention_layernorm 的输入），
+    # forward_hook 捕获的是模块输出，语义位置会更靠后。
+    handle = target_module.register_forward_pre_hook(pre_hook_fn)
+    try:
+        outputs = call_layer_forward(layer, hidden_states, layer_kwargs=layer_kwargs, **kwargs)
+    finally:
+        handle.remove()
+
+    hidden_states_out = extract_hidden_states(outputs)
+    return hidden_states_out, captured.get("input", None)
+
+
 @torch.no_grad()
 def capture_router_labels_layerwise(layer, inps, dev, topk=20, logger=None, layer_kwargs=None):
     """
@@ -319,6 +373,100 @@ def get_omni_parameters(model, use_shift=True):
         if n.find('bound_factor') > -1 or n.find(template) > -1:
             params.append(m)
     return iter(params)  
+
+
+def get_stage_named_parameters(
+    model,
+    stage,
+    use_shift=True,
+    train_shared_gate=False,
+    train_gate_lora=False,
+):
+    """
+    Collect stage-specific trainable parameters.
+
+    stage:
+      - "ri": router calibration only (router main weight/bias)
+      - "mi": LET/LWC + optional shared gate + optional LoRA adapters
+      - "z": no trainable parameters
+    """
+    stage = stage.lower()
+    named_params = []
+
+    if stage == "z":
+        return named_params
+
+    if stage == "ri":
+        for module_name, module in model.named_modules():
+            if not module_name.endswith("mlp.gate"):
+                continue
+            if hasattr(module, "weight") and isinstance(module.weight, torch.nn.Parameter):
+                named_params.append((f"{module_name}.weight", module.weight))
+            if hasattr(module, "bias") and isinstance(module.bias, torch.nn.Parameter) and module.bias is not None:
+                named_params.append((f"{module_name}.bias", module.bias))
+        return named_params
+
+    if stage == "mi":
+        template = "smooth" if use_shift else "smooth_scale"
+        for name, param in model.named_parameters():
+            if "bound_factor" in name or template in name:
+                named_params.append((name, param))
+
+        if train_shared_gate:
+            for module_name, module in model.named_modules():
+                if module_name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
+                    for p_name, param in module.named_parameters(recurse=False):
+                        named_params.append((f"{module_name}.{p_name}", param))
+
+        if train_gate_lora:
+            for module_name, module in model.named_modules():
+                if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+                    named_params.append((f"{module_name}.lora_A", module.lora_A))
+                    named_params.append((f"{module_name}.lora_B", module.lora_B))
+
+        return named_params
+
+    raise ValueError(f"Unsupported stage: {stage}")
+
+
+def set_stage_trainable_params(
+    model,
+    stage,
+    use_shift=True,
+    train_shared_gate=False,
+    train_gate_lora=False,
+):
+    """Set requires_grad according to stage and return selected parameters."""
+    selected = get_stage_named_parameters(
+        model,
+        stage,
+        use_shift=use_shift,
+        train_shared_gate=train_shared_gate,
+        train_gate_lora=train_gate_lora,
+    )
+    selected_ids = {id(param) for _, param in selected}
+    for _, param in model.named_parameters():
+        param.requires_grad = id(param) in selected_ids
+    return selected
+
+
+def assert_tensors_on_same_device(tensors, logger=None, context=""):
+    """Raise RuntimeError when provided tensors are not on the same device."""
+    device_map = {}
+    for name, tensor in tensors.items():
+        if tensor is None:
+            continue
+        if not torch.is_tensor(tensor):
+            continue
+        device_map.setdefault(str(tensor.device), []).append(name)
+
+    if len(device_map) <= 1:
+        return
+
+    message = f"Device mismatch{f' ({context})' if context else ''}: {device_map}"
+    if logger is not None:
+        logger.error(message)
+    raise RuntimeError(message)
 
 def omni_state_dict(model, destination=None, prefix='', keep_vars=False):
     if destination is None:
