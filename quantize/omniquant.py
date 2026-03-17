@@ -132,6 +132,41 @@ def stage_should_quantize_linear(stage_name, module_name):
         return stage_is_moe_linear(module_name) and (not stage_is_attn_linear(module_name))
     return True
 
+
+def sanitize_quant_runtime_tensors(module):
+    """Detach runtime quantizer tensors so modules remain safe for deepcopy."""
+    for _, sub_module in module.named_modules():
+        if not isinstance(sub_module, QuantLinear):
+            continue
+        quantizer = sub_module.weight_quantizer
+        for attr_name in ("scale", "round_zero_point", "scales", "zeros"):
+            if not hasattr(quantizer, attr_name):
+                continue
+            value = getattr(quantizer, attr_name)
+            if torch.is_tensor(value) and (value.grad_fn is not None):
+                setattr(quantizer, attr_name, value.detach().clone())
+
+
+def safe_clone_layer_for_training(layer, logger=None, layer_idx=None, stage_name=None):
+    """Deepcopy layer when possible; fall back to in-place usage if torch rejects deepcopy."""
+    sanitize_quant_runtime_tensors(layer)
+    try:
+        return copy.deepcopy(layer)
+    except RuntimeError as err:
+        err_msg = str(err)
+        if "deepcopy protocol" not in err_msg:
+            raise
+        if logger is not None:
+            logger.warning(
+                "[Stage %s] Layer %s: deepcopy failed (%s). Falling back to in-place layer reuse.",
+                stage_name,
+                layer_idx,
+                err_msg,
+            )
+        for param in layer.parameters():
+            param.grad = None
+        return layer
+
 def omniquant(
     lm,
     args,
@@ -399,7 +434,12 @@ def omniquant(
         if "mixtral" in args.net.lower() or "qwen" in args.net.lower():  
             # For MoE models (Mixtral, Qwen MoE), only the LWC-style path is supported.
             # Simply replace Linear with QuantLinear, do not quantize router (gate)
-            qlayer = copy.deepcopy(layer)
+            qlayer = safe_clone_layer_for_training(
+                layer,
+                logger=logger,
+                layer_idx=i,
+                stage_name=layer_stage,
+            )
             
             for name, module in qlayer.named_modules():
                 if isinstance(module, torch.nn.Linear):
