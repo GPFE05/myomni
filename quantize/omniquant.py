@@ -359,7 +359,7 @@ def omniquant(
         elif layer_stage == "Z":
             logger.info(f"=== [Stage Z] Start quantize layer {i} (last-moe-only) ===")
         else:
-            logger.info(f"=== [Stage A{i}] Start quantize layer {i} (Ri+Mi unit) ===")
+            logger.info(f"=== [Stage Ai] Start quantize layer {i} (Ri+Mi unit) ===")
 
         layer = layers[i].to(dev)
         if i not in fp_teacher_layers:
@@ -394,6 +394,8 @@ def omniquant(
                     n_quantlinear = QuantLinear(n_module, n_weight_params, args.act_quant_params)
                     add_new_module(n_name, next_layer_student, n_quantlinear)
             next_layer_student = next_layer_student.to(dev)
+            # Keep quant behavior aligned with qlayer: temporary weight quant + optional act quant.
+            set_quant_state(next_layer_student, weight_quant=False, act_quant=True)
         if "mixtral" in args.net.lower() or "qwen" in args.net.lower():  
             # For MoE models (Mixtral, Qwen MoE), only the LWC-style path is supported.
             # Simply replace Linear with QuantLinear, do not quantize router (gate)
@@ -791,6 +793,15 @@ def omniquant(
                 train_gate_lora=(train_gate_lora and stage_gate_train_enabled),
             )
 
+            # [BugFix] 在 Ai 和 Z 阶段，由于当前层的 attention 已经在前面的阶段进行过量化并训练，
+            # 需要将其对应的量化参数（包含由于名字匹配被意外 enable 的 bound_factor 和 smooth 参数）彻底冻结，
+            # 以保证“独立训练当前层的 router+moe 以及下一层 attention” 不干扰已收敛的当前层 attention。
+            if layer_stage in ["Ai", "Z"]:
+                for name, param in qlayer.named_parameters():
+                    # 识别所有隶属于当前层 attention 相关的参数，将其拦截
+                    if name.startswith("self_attn.") or "qkt_smooth_scale" in name or "qkv_smooth" in name or "out_smooth" in name or "q_proj_smooth" in name or "k_proj_smooth" in name or "v_proj_smooth" in name or "o_proj_smooth" in name:
+                        param.requires_grad = False
+
             if next_layer_student is not None:
                 # 下一层 attention 分支仅训练其量化参数（主要是 LWC 的 bound_factor）。
                 # 这里不引入 shared_gate / LoRA，避免跨层参数语义污染。
@@ -805,8 +816,8 @@ def omniquant(
             # create optimizer with parameter groups
             # LET/LWC parameters use weight_decay=0 (fixed, not controlled by args.wd)
             param_groups = [
-                {"params": let_parameters(qlayer, use_shift), "lr": args.let_lr, "weight_decay": 0},
-                {"params": lwc_parameters(qlayer), "lr": args.lwc_lr, "weight_decay": 0}
+                {"params": [p for p in let_parameters(qlayer, use_shift) if p.requires_grad], "lr": args.let_lr, "weight_decay": 0},
+                {"params": [p for p in lwc_parameters(qlayer) if p.requires_grad], "lr": args.lwc_lr, "weight_decay": 0}
             ]
             
             # Add shared_expert_gate parameters if training is enabled (uses args.wd)
@@ -839,7 +850,7 @@ def omniquant(
             
             # Collect all trainable parameters for gradient clipping
             # Start with quantization parameters (LET/LWC)
-            clip_parameters = list(get_omni_parameters(qlayer, use_shift))
+            clip_parameters = [p for p in get_omni_parameters(qlayer, use_shift) if p.requires_grad]
             
             # Add shared_expert_gate parameters if training is enabled
             if train_shared_gate and stage_gate_train_enabled:
@@ -1120,6 +1131,7 @@ def omniquant(
         if next_layer_fp is not None:
             if next_layer_student is not None:
                 # 将训练后的 next-attn 学生分支写回下一层，供后续阶段继续使用。
+                next_layer_student.zero_grad(set_to_none=True)
                 register_scales_and_zeros(next_layer_student)
                 layers[i + 1] = next_layer_student.to("cpu")
                 del next_layer_student
@@ -1150,6 +1162,17 @@ def omniquant(
         # teacher 快照用完后立即回迁 CPU，避免多层 teacher 常驻 GPU 导致显存累计。
         fp_teacher_layers[i] = teacher_layer.to("cpu")
         del teacher_layer
+
+        # Keep only snapshots needed by the very next stage to avoid CPU memory growth.
+        keep_teacher_ids = set()
+        if layer_stage == "A0":
+            keep_teacher_ids.add(i)
+        elif layer_stage == "Ai" and i < len(layers) - 1:
+            keep_teacher_ids.add(i + 1)
+        for cached_idx in list(fp_teacher_layers.keys()):
+            if cached_idx not in keep_teacher_ids:
+                del fp_teacher_layers[cached_idx]
+
         torch.cuda.empty_cache()
 
     del inps
