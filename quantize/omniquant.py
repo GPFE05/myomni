@@ -167,6 +167,149 @@ def safe_clone_layer_for_training(layer, logger=None, layer_idx=None, stage_name
             param.grad = None
         return layer
 
+
+def _param_is_attn_related(param_name):
+    return (
+        param_name.startswith("self_attn.")
+        or "qkv_smooth" in param_name
+        or "out_smooth" in param_name
+        or "qkt_smooth" in param_name
+        or "q_proj_smooth" in param_name
+        or "k_proj_smooth" in param_name
+        or "v_proj_smooth" in param_name
+        or "o_proj_smooth" in param_name
+    )
+
+
+def _classify_trainable_params(module):
+    names = [name for name, param in module.named_parameters() if param.requires_grad]
+    summary = {
+        "total": len(names),
+        "attention": [],
+        "moe": [],
+        "router": [],
+        "shared_gate": [],
+        "lora": [],
+        "quant": [],
+        "other": [],
+    }
+
+    for name in names:
+        is_attn = _param_is_attn_related(name)
+        is_router = name.endswith("mlp.gate.weight") or name.endswith("mlp.gate.bias") or name == "mlp.gate.weight" or name == "mlp.gate.bias"
+        is_shared = "shared_expert_gate" in name
+        is_lora = name.endswith("lora_A") or name.endswith("lora_B")
+        is_quant = ("bound_factor" in name) or ("smooth" in name)
+        is_moe = name.startswith("mlp.") and (not is_router)
+
+        if is_attn:
+            summary["attention"].append(name)
+        if is_moe:
+            summary["moe"].append(name)
+        if is_router:
+            summary["router"].append(name)
+        if is_shared:
+            summary["shared_gate"].append(name)
+        if is_lora:
+            summary["lora"].append(name)
+        if is_quant:
+            summary["quant"].append(name)
+
+        if not (is_attn or is_moe or is_router or is_shared or is_lora or is_quant):
+            summary["other"].append(name)
+
+    return summary
+
+
+def _stage_expectation_checks(
+    summary,
+    stage_name,
+    module_tag,
+    train_shared_gate=False,
+    train_gate_lora=False,
+):
+    issues = []
+    if module_tag == "qlayer":
+        if stage_name == "A0":
+            if len(summary["moe"]) > 0 or len(summary["router"]) > 0:
+                issues.append("A0 should not train qlayer MoE/router parameters")
+            if len(summary["attention"]) == 0:
+                issues.append("A0 should train qlayer attention quant parameters")
+        elif stage_name in {"Ai", "Z"}:
+            if len(summary["attention"]) > 0:
+                issues.append(f"{stage_name} should keep qlayer attention parameters frozen")
+        if (not train_shared_gate) and len(summary["shared_gate"]) > 0:
+            issues.append("shared gate params are trainable but train_shared_gate=False")
+        if (not train_gate_lora) and len(summary["lora"]) > 0:
+            issues.append("LoRA params are trainable but train_gate_lora=False")
+
+    if module_tag == "next_attn":
+        if len(summary["attention"]) == 0:
+            issues.append("next_attn branch should expose trainable attention quant params")
+        if len(summary["moe"]) > 0 or len(summary["router"]) > 0 or len(summary["shared_gate"]) > 0 or len(summary["lora"]) > 0:
+            issues.append("next_attn branch should not train MoE/router/shared_gate/LoRA params")
+
+    return issues
+
+
+def log_and_assert_stage_trainability(
+    logger,
+    module,
+    stage_name,
+    layer_idx,
+    module_tag,
+    train_shared_gate=False,
+    train_gate_lora=False,
+):
+    summary = _classify_trainable_params(module)
+    logger.info(
+        f"[Stage Assert] layer={layer_idx} stage={stage_name} module={module_tag} "
+        f"trainable_total={summary['total']} attn={len(summary['attention'])} moe={len(summary['moe'])} "
+        f"router={len(summary['router'])} shared_gate={len(summary['shared_gate'])} "
+        f"lora={len(summary['lora'])} quant={len(summary['quant'])} other={len(summary['other'])}"
+    )
+    if summary["total"] > 0:
+        preview = summary["attention"][:2] + summary["moe"][:2] + summary["router"][:2] + summary["lora"][:2] + summary["shared_gate"][:2] + summary["other"][:2]
+        if preview:
+            logger.info(f"[Stage Assert] layer={layer_idx} stage={stage_name} module={module_tag} sample_trainable={preview}")
+
+    issues = _stage_expectation_checks(
+        summary,
+        stage_name=stage_name,
+        module_tag=module_tag,
+        train_shared_gate=train_shared_gate,
+        train_gate_lora=train_gate_lora,
+    )
+    if issues:
+        raise RuntimeError(
+            f"Stage trainability assertion failed at layer={layer_idx}, stage={stage_name}, module={module_tag}: "
+            + " | ".join(issues)
+        )
+
+
+def _assert_quantized_coverage(stage_name, layer_idx, qlayer_quantized_names, next_attn_quantized_names=None):
+    attn_q = [n for n in qlayer_quantized_names if stage_is_attn_linear(n)]
+    moe_q = [n for n in qlayer_quantized_names if stage_is_moe_linear(n)]
+
+    if stage_name == "A0":
+        if len(attn_q) == 0:
+            raise RuntimeError(f"Stage A0 layer={layer_idx}: expected attention quantized linears in qlayer")
+        if len(moe_q) > 0:
+            raise RuntimeError(f"Stage A0 layer={layer_idx}: unexpected MoE quantized linears in qlayer: {moe_q[:4]}")
+    elif stage_name == "Ai":
+        if len(moe_q) == 0:
+            raise RuntimeError(f"Stage Ai layer={layer_idx}: expected MoE quantized linears in qlayer")
+        if len(attn_q) > 0:
+            raise RuntimeError(f"Stage Ai layer={layer_idx}: unexpected attention quantized linears in qlayer: {attn_q[:4]}")
+        if next_attn_quantized_names is None or len(next_attn_quantized_names) == 0:
+            raise RuntimeError(f"Stage Ai layer={layer_idx}: expected next-layer attention quantized linears")
+    elif stage_name == "Z":
+        if len(moe_q) == 0:
+            raise RuntimeError(f"Stage Z layer={layer_idx}: expected MoE quantized linears in qlayer")
+        if len(attn_q) > 0:
+            raise RuntimeError(f"Stage Z layer={layer_idx}: unexpected attention quantized linears in qlayer: {attn_q[:4]}")
+
+
 def omniquant(
     lm,
     args,
@@ -353,28 +496,8 @@ def omniquant(
 
     logger.info("[Stage] Schedule initialized: A0 -> (Ri+Mi)* -> Z")
 
-    # ======================== 阶段辅助函数（中文详细注释） ========================
-    # 说明：当前代码仍基于“逐层主循环”演进，为了逐步收敛到 A0/(Ri+Mi)/Z，
-    # 我们先把“阶段语义”显式化，后续再进一步抽离为独立 dispatcher。
-    def _build_stage_units(total_layers):
-        return stage_build_units(total_layers)
-
-    def _is_attn_linear(module_name):
-        return stage_is_attn_linear(module_name)
-
-    def _is_router_gate(module_name):
-        return stage_is_router_gate(module_name)
-
-    def _is_shared_expert_gate(module_name):
-        return stage_is_shared_expert_gate(module_name)
-
-    def _is_moe_related_linear(module_name):
-        return stage_is_moe_linear(module_name)
-
-    def _should_quantize_linear_for_stage(stage_name, module_name):
-        return stage_should_quantize_linear(stage_name, module_name)
-
-    stage_units = _build_stage_units(len(layers))
+    # 显式阶段序列：A0 -> Ai* -> Z
+    stage_units = stage_build_units(len(layers))
 
     # 保存每层的 FP16 teacher 快照，保证 Ri 与 expert shift 标签不依赖已量化学生层。
     # 说明：
@@ -388,6 +511,8 @@ def omniquant(
         stage_train_enabled = args.epochs > 0
         should_roll_buffers = stage_train_enabled and layer_stage == "Ai"
         stage_gate_train_enabled = layer_stage in {"Ai", "Z"}
+        qlayer_quantized_names = []
+        next_attn_quantized_names = []
 
         if layer_stage == "A0":
             logger.info(f"=== [Stage A0] Start stage on layer {i} (attention-only) ===")
@@ -424,13 +549,15 @@ def omniquant(
             # 3) 训练时通过 next_layer_student 在 post_attention_layernorm 输入处与 FP16 teacher 对齐。
             next_layer_student = copy.deepcopy(next_layer_fp)
             for n_name, n_module in next_layer_student.named_modules():
-                if isinstance(n_module, torch.nn.Linear) and _is_attn_linear(n_name):
+                if isinstance(n_module, torch.nn.Linear) and stage_is_attn_linear(n_name):
                     n_weight_params = args.attn_weight_quant_params if args.attn_weight_quant_params is not None else args.weight_quant_params
                     n_quantlinear = QuantLinear(n_module, n_weight_params, args.act_quant_params)
                     add_new_module(n_name, next_layer_student, n_quantlinear)
+                    next_attn_quantized_names.append(n_name)
             next_layer_student = next_layer_student.to(dev)
             # Keep quant behavior aligned with qlayer: temporary weight quant + optional act quant.
             set_quant_state(next_layer_student, weight_quant=False, act_quant=True)
+            logger.info(f"[Stage Assert] layer={i} stage={layer_stage} module=next_attn quantized_linears={len(next_attn_quantized_names)}")
         if "mixtral" in args.net.lower() or "qwen" in args.net.lower():  
             # For MoE models (Mixtral, Qwen MoE), only the LWC-style path is supported.
             # Simply replace Linear with QuantLinear, do not quantize router (gate)
@@ -444,11 +571,11 @@ def omniquant(
             for name, module in qlayer.named_modules():
                 if isinstance(module, torch.nn.Linear):
                     # Target 1: Shared Expert Gate - name ends with "shared_expert_gate"
-                    is_shared_expert_gate = _is_shared_expert_gate(name)
+                    is_shared_expert_gate = stage_is_shared_expert_gate(name)
                     
                     # Target 2: Router Gate - name ends with ".gate" (NOT "gate_proj")
                     # e.g., "mlp.gate" is router, but "mlp.experts.0.gate_proj" is NOT
-                    is_router_gate = _is_router_gate(name)
+                    is_router_gate = stage_is_router_gate(name)
                     
                     if is_shared_expert_gate:
                         if train_shared_gate and stage_gate_train_enabled:
@@ -464,19 +591,32 @@ def omniquant(
                             add_new_module(name, qlayer, lora_linear)
                         # else: skip, keep as frozen nn.Linear (default behavior)
                     else:
-                        if not _should_quantize_linear_for_stage(layer_stage, name):
+                        if not stage_should_quantize_linear(layer_stage, name):
                             # 阶段过滤：例如 Z 阶段不应再碰最后层 attention 线性层。
                             continue
 
                         # Target 3: All other linear layers (including gate_proj)
                         # Replace with QuantLinear
-                        is_attn_linear = _is_attn_linear(name)
+                        is_attn_linear = stage_is_attn_linear(name)
                         weight_params = args.attn_weight_quant_params if (is_attn_linear and args.attn_weight_quant_params is not None) else args.weight_quant_params
                         quantlinear = QuantLinear(module, weight_params, args.act_quant_params)
-                        add_new_module(name, qlayer, quantlinear)    
+                        add_new_module(name, qlayer, quantlinear)
+                        qlayer_quantized_names.append(name)
         else:
             qlayer = DecoderLayer(lm.model.config, layer, args)
         qlayer = qlayer.to(dev)
+
+        _assert_quantized_coverage(
+            stage_name=layer_stage,
+            layer_idx=i,
+            qlayer_quantized_names=qlayer_quantized_names,
+            next_attn_quantized_names=next_attn_quantized_names,
+        )
+        logger.info(
+            f"[Stage Assert] layer={i} stage={layer_stage} module=qlayer quantized_linears={len(qlayer_quantized_names)} "
+            f"attn={len([n for n in qlayer_quantized_names if stage_is_attn_linear(n)])} "
+            f"moe={len([n for n in qlayer_quantized_names if stage_is_moe_linear(n)])}"
+        )
 
         # =================================================================
         # Expert Shift Tracking for Qwen MoE
@@ -612,6 +752,18 @@ def omniquant(
                     # - 仅允许 router 主权重/偏置参与训练
                     # - 明确禁止 LoRA A/B、LET/LWC、shared gate 等参数更新
                     ri_named_params = set_stage_trainable_params(qlayer, stage="ri")
+                    ri_names = [name for name, _ in ri_named_params]
+                    invalid_ri_names = [
+                        name for name in ri_names
+                        if name not in {"mlp.gate.weight", "mlp.gate.bias"}
+                    ]
+                    if invalid_ri_names:
+                        raise RuntimeError(
+                            f"Router calibration Ri expects only mlp.gate.(weight|bias), got: {invalid_ri_names[:8]}"
+                        )
+                    logger.info(
+                        f"[Stage Assert] layer={i} stage=Ri module=qlayer trainable={ri_names}"
+                    )
 
                     # 将白名单参数转为优化器参数列表，并做去重。
                     router_gate_params = []
@@ -849,6 +1001,26 @@ def omniquant(
                     next_layer_student,
                     stage="mi",
                     use_shift=False,
+                    train_shared_gate=False,
+                    train_gate_lora=False,
+                )
+
+            log_and_assert_stage_trainability(
+                logger=logger,
+                module=qlayer,
+                stage_name=layer_stage,
+                layer_idx=i,
+                module_tag="qlayer",
+                train_shared_gate=(train_shared_gate and stage_gate_train_enabled),
+                train_gate_lora=(train_gate_lora and stage_gate_train_enabled),
+            )
+            if next_layer_student is not None:
+                log_and_assert_stage_trainability(
+                    logger=logger,
+                    module=next_layer_student,
+                    stage_name=layer_stage,
+                    layer_idx=i,
+                    module_tag="next_attn",
                     train_shared_gate=False,
                     train_gate_lora=False,
                 )
