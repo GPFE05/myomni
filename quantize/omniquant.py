@@ -281,33 +281,107 @@ def log_and_assert_stage_trainability(
         train_gate_lora=train_gate_lora,
     )
     if issues:
-        raise RuntimeError(
-            f"Stage trainability assertion failed at layer={layer_idx}, stage={stage_name}, module={module_tag}: "
+        logger.error(
+            f"[Stage Assert][ANOMALY] layer={layer_idx} stage={stage_name} module={module_tag}: "
             + " | ".join(issues)
         )
 
 
-def _assert_quantized_coverage(stage_name, layer_idx, qlayer_quantized_names, next_attn_quantized_names=None):
+def _assert_quantized_coverage(logger, stage_name, layer_idx, qlayer_quantized_names, next_attn_quantized_names=None):
     attn_q = [n for n in qlayer_quantized_names if stage_is_attn_linear(n)]
     moe_q = [n for n in qlayer_quantized_names if stage_is_moe_linear(n)]
+    issues = []
 
     if stage_name == "A0":
         if len(attn_q) == 0:
-            raise RuntimeError(f"Stage A0 layer={layer_idx}: expected attention quantized linears in qlayer")
+            issues.append("expected attention quantized linears in qlayer")
         if len(moe_q) > 0:
-            raise RuntimeError(f"Stage A0 layer={layer_idx}: unexpected MoE quantized linears in qlayer: {moe_q[:4]}")
+            issues.append(f"unexpected MoE quantized linears in qlayer: {moe_q[:4]}")
     elif stage_name == "Ai":
         if len(moe_q) == 0:
-            raise RuntimeError(f"Stage Ai layer={layer_idx}: expected MoE quantized linears in qlayer")
+            issues.append("expected MoE quantized linears in qlayer")
         if len(attn_q) > 0:
-            raise RuntimeError(f"Stage Ai layer={layer_idx}: unexpected attention quantized linears in qlayer: {attn_q[:4]}")
+            issues.append(f"unexpected attention quantized linears in qlayer: {attn_q[:4]}")
         if next_attn_quantized_names is None or len(next_attn_quantized_names) == 0:
-            raise RuntimeError(f"Stage Ai layer={layer_idx}: expected next-layer attention quantized linears")
+            issues.append("expected next-layer attention quantized linears")
     elif stage_name == "Z":
         if len(moe_q) == 0:
-            raise RuntimeError(f"Stage Z layer={layer_idx}: expected MoE quantized linears in qlayer")
+            issues.append("expected MoE quantized linears in qlayer")
         if len(attn_q) > 0:
-            raise RuntimeError(f"Stage Z layer={layer_idx}: unexpected attention quantized linears in qlayer: {attn_q[:4]}")
+            issues.append(f"unexpected attention quantized linears in qlayer: {attn_q[:4]}")
+
+    if issues:
+        logger.error(
+            f"[Stage Assert][ANOMALY] layer={layer_idx} stage={stage_name} module=qlayer-coverage: "
+            + " | ".join(issues)
+        )
+
+
+def log_and_assert_dataflow(
+    logger,
+    layer_idx,
+    stage_name,
+    nsamples,
+    stage_train_enabled,
+    use_next_attn_loss,
+    aug_loss,
+    should_roll_buffers,
+    fp_teacher_updates,
+    fp_local_target_updates,
+    fp_aug_updates,
+    fp_aug_local_target_updates,
+    teacher_next_attn_updates,
+    quant_roll_updates,
+):
+    if not stage_train_enabled:
+        return
+
+    logger.info(
+        f"[Dataflow Assert] layer={layer_idx} stage={stage_name} "
+        f"fp_teacher_updates={fp_teacher_updates} fp_local_target_updates={fp_local_target_updates} "
+        f"fp_aug_updates={fp_aug_updates} fp_aug_local_target_updates={fp_aug_local_target_updates} "
+        f"teacher_next_attn_updates={teacher_next_attn_updates} quant_roll_updates={quant_roll_updates}"
+    )
+
+    issues = []
+
+    if stage_name == "A0":
+        if fp_local_target_updates != nsamples:
+            issues.append(f"expected fp_local_target_updates={nsamples}, got {fp_local_target_updates}")
+        if fp_teacher_updates != 0:
+            issues.append(f"fp_inps should not roll, got fp_teacher_updates={fp_teacher_updates}")
+    else:
+        if fp_teacher_updates != nsamples:
+            issues.append(f"expected fp_teacher_updates={nsamples}, got {fp_teacher_updates}")
+
+    if use_next_attn_loss and teacher_next_attn_updates != nsamples:
+        issues.append(f"expected teacher_next_attn_updates={nsamples}, got {teacher_next_attn_updates}")
+
+    if (not use_next_attn_loss) and teacher_next_attn_updates != 0:
+        issues.append(f"teacher_next_attn should be disabled, got updates={teacher_next_attn_updates}")
+
+    if aug_loss:
+        if stage_name == "A0":
+            if fp_aug_local_target_updates != nsamples:
+                issues.append(f"expected fp_aug_local_target_updates={nsamples}, got {fp_aug_local_target_updates}")
+            if fp_aug_updates != 0:
+                issues.append(f"fp_inps_2 should not roll, got fp_aug_updates={fp_aug_updates}")
+        else:
+            if fp_aug_updates != nsamples:
+                issues.append(f"expected fp_aug_updates={nsamples}, got {fp_aug_updates}")
+
+    if should_roll_buffers:
+        if quant_roll_updates != nsamples:
+            issues.append(f"expected quant_roll_updates={nsamples}, got {quant_roll_updates}")
+    else:
+        if quant_roll_updates != 0:
+            issues.append(f"quant_inps should not roll, got quant_roll_updates={quant_roll_updates}")
+
+    if issues:
+        logger.error(
+            f"[Dataflow Assert][ANOMALY] layer={layer_idx} stage={stage_name}: "
+            + " | ".join(issues)
+        )
 
 
 def omniquant(
@@ -465,6 +539,9 @@ def omniquant(
     quant_inps = inps
     fp_inps = copy.deepcopy(inps)   # take output of fp model as input
     fp_inps_2 = copy.deepcopy(inps) if args.aug_loss else None # take output of quantization model as input
+
+    if quant_inps.shape != fp_inps.shape:
+        logger.error(f"[Dataflow Assert][ANOMALY] init mismatch: quant_inps.shape={quant_inps.shape}, fp_inps.shape={fp_inps.shape}")
     
     attention_mask = cache["attention_mask"]
 
@@ -607,6 +684,7 @@ def omniquant(
         qlayer = qlayer.to(dev)
 
         _assert_quantized_coverage(
+            logger=logger,
             stage_name=layer_stage,
             layer_idx=i,
             qlayer_quantized_names=qlayer_quantized_names,
@@ -758,8 +836,9 @@ def omniquant(
                         if name not in {"mlp.gate.weight", "mlp.gate.bias"}
                     ]
                     if invalid_ri_names:
-                        raise RuntimeError(
-                            f"Router calibration Ri expects only mlp.gate.(weight|bias), got: {invalid_ri_names[:8]}"
+                        logger.error(
+                            f"[Stage Assert][ANOMALY] layer={i} stage=Ri module=qlayer: "
+                            f"Ri expects only mlp.gate.(weight|bias), got: {invalid_ri_names[:8]}"
                         )
                     logger.info(
                         f"[Stage Assert] layer={i} stage=Ri module=qlayer trainable={ri_names}"
@@ -881,6 +960,12 @@ def omniquant(
         teacher_next_attn_targets = None
         stage_fp_targets = fp_inps
         stage_fp_targets_2 = fp_inps_2
+        fp_teacher_updates = 0
+        fp_local_target_updates = 0
+        fp_aug_updates = 0
+        fp_aug_local_target_updates = 0
+        teacher_next_attn_updates = 0
+        quant_roll_updates = 0
         if layer_stage == "A0" and stage_train_enabled:
             # A0 uses local targets only; global rolling buffers should not advance here.
             stage_fp_targets = torch.zeros_like(fp_inps)
@@ -904,8 +989,10 @@ def omniquant(
                         ))
                         if layer_stage == "A0":
                             stage_fp_targets[j] = fp_layer_out
+                            fp_local_target_updates += 1
                         else:
                             fp_inps[j] = fp_layer_out
+                            fp_teacher_updates += 1
 
                         if use_next_attn_loss:
                             # 设备一致性检查：teacher 目标张量和 next block 参数必须同设备。
@@ -930,6 +1017,7 @@ def omniquant(
                                 detach_input=True,
                             )
                             teacher_next_attn_targets[j] = teacher_attn_out.squeeze(0).to(teacher_next_attn_targets.dtype)
+                            teacher_next_attn_updates += 1
 
                         if args.aug_loss:
                             fp_aug_out = extract_hidden_states(call_layer_forward(
@@ -941,8 +1029,10 @@ def omniquant(
                             ))
                             if layer_stage == "A0":
                                 stage_fp_targets_2[j] = fp_aug_out
+                                fp_aug_local_target_updates += 1
                             else:
                                 fp_inps_2[j] = fp_aug_out
+                                fp_aug_updates += 1
         # init smooth parameters
         set_quant_state(qlayer, weight_quant=False, act_quant=True)  # weight will be manually quantized before forward
         qlayer.let = args.let
@@ -1331,6 +1421,24 @@ def omniquant(
                                 attention_mask=attention_mask,
                                 position_ids=position_ids
                             ))
+                            quant_roll_updates += 1
+
+            log_and_assert_dataflow(
+                logger=logger,
+                layer_idx=i,
+                stage_name=layer_stage,
+                nsamples=args.nsamples,
+                stage_train_enabled=stage_train_enabled,
+                use_next_attn_loss=use_next_attn_loss,
+                aug_loss=args.aug_loss,
+                should_roll_buffers=should_roll_buffers,
+                fp_teacher_updates=fp_teacher_updates,
+                fp_local_target_updates=fp_local_target_updates,
+                fp_aug_updates=fp_aug_updates,
+                fp_aug_local_target_updates=fp_aug_local_target_updates,
+                teacher_next_attn_updates=teacher_next_attn_updates,
+                quant_roll_updates=quant_roll_updates,
+            )
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
             omni_parameters[i] = omni_state_dict(qlayer)
