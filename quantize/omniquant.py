@@ -175,15 +175,15 @@ def omniquant(
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
         layer_name_prefix = "model.layers"
-    elif 'qwen' in args.net.lower():
+    elif 'qwen' in args.net.lower() or 'deepseek' in args.net.lower():
         is_llama = True   # same to llama except ffn (MoE structure)
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
-        # Qwen MoE models only support the MoE/LWC path here, no DecoderLayer wrapper is needed.
+        # Qwen/DeepSeek MoE models only support the MoE/LWC path here, no DecoderLayer wrapper is needed.
         layer_name_prefix = "model.layers"
     else:
-        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen/deepseek now")
     
     
     layers[0] = layers[0].to(dev)
@@ -229,7 +229,7 @@ def omniquant(
     # move embedding layer and first layer to cpu
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "llama" in args.net.lower() or "mixtral" in args.net.lower() or "qwen" in args.net.lower():
+    if "llama" in args.net.lower() or "mixtral" in args.net.lower() or "qwen" in args.net.lower() or "deepseek" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
     elif "opt" in args.net.lower():
@@ -242,7 +242,7 @@ def omniquant(
     elif 'falcon' in args.model:
         model.transformer.word_embeddings =  model.transformer.word_embeddings.cpu()
     else:
-        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen/deepseek now")
     torch.cuda.empty_cache()
 
     
@@ -281,8 +281,8 @@ def omniquant(
     for i in range(len(layers)):
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
-        if "mixtral" in args.net.lower() or "qwen" in args.net.lower():  
-            # For MoE models (Mixtral, Qwen MoE), only the LWC-style path is supported.
+        if "mixtral" in args.net.lower() or "qwen" in args.net.lower() or "deepseek" in args.net.lower():  
+            # For MoE models (Mixtral, Qwen MoE, DeepSeek MoE), only the LWC-style path is supported.
             # Simply replace Linear with QuantLinear, do not quantize router (gate)
             qlayer = copy.deepcopy(layer)
             
@@ -320,7 +320,7 @@ def omniquant(
         qlayer = qlayer.to(dev)
 
         # =================================================================
-        # Expert Shift Tracking for Qwen MoE
+        # Expert Shift Tracking for Qwen/DeepSeek MoE
         # Flow: 
         #   1. Capture FP16 teacher labels from ORIGINAL layer
         #   2. Set quantization state on qlayer
@@ -330,12 +330,12 @@ def omniquant(
         #   6. LWC training
         #   7. Compute Post-LWC Expert Shift
         # =================================================================
-        is_qwen_moe = "qwen" in args.net.lower()
+        is_qwen_or_deepseek_moe = ("qwen" in args.net.lower()) or ("deepseek" in args.net.lower())
         cached_router_labels = None
         pre_lwc_shift = None
         post_calib_shift = None
         
-        if is_qwen_moe:
+        if is_qwen_or_deepseek_moe:
             logger.info(f"[Expert Shift] Layer {i}: Starting expert shift tracking...")
             
             # Convert qlayer to FP32 for stable computation (same as LWC training)
@@ -783,9 +783,9 @@ def omniquant(
                         logger.info(f"Merged LoRA weights for {name}")
         
         # =================================================================
-        # Post-LWC Expert Shift Check (always for Qwen MoE)
+        # Post-LWC Expert Shift Check (always for Qwen/DeepSeek MoE)
         # =================================================================
-        if is_qwen_moe and cached_router_labels is not None:
+        if is_qwen_or_deepseek_moe and cached_router_labels is not None:
             teacher_logits, teacher_indices = cached_router_labels
             seqlen = fp_inps.shape[1]
             

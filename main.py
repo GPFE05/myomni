@@ -75,6 +75,9 @@ def get_no_split_module_classes(net_name):
             "Qwen3MoeDecoderLayer",
         ])
 
+    if "deepseek" in net_name:
+        classes.append("DeepseekDecoderLayer")
+
     return classes
 
 
@@ -277,7 +280,7 @@ def evaluate(lm, args, logger):
         df.to_csv(csv_path, index=False)
 
     model = lm.model
-    if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "qwen" in args.net.lower():
+    if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "qwen" in args.net.lower() or "mixtral" in args.net.lower() or "deepseek" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
     elif "opt" in args.net.lower():
@@ -420,7 +423,7 @@ def main():
     parser.add_argument("--act-scales", type=str, default=None)
     parser.add_argument("--act-shifts", type=str, default=None)
     parser.add_argument("--train_shared_gate", default=False, action="store_true",
-                        help="Train shared_expert_gate layers during calibration (only applies to Qwen MoE variants that expose shared_expert_gate)")
+                        help="Train shared_expert_gate layers during calibration (applies to Qwen/DeepSeek MoE variants that expose shared_expert_gate)")
     parser.add_argument("--train_gate_lora", default=False, action="store_true",
                         help="Apply LoRA to mlp.gate (router) layers and train them (for MoE models)")
     parser.add_argument("--shared_gate_lr", type=float, default=1e-4,
@@ -429,9 +432,9 @@ def main():
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank for gate training")
     parser.add_argument("--lora_alpha", type=float, default=16, help="LoRA alpha (scaling factor) for gate training")
     
-    # Router Calibration arguments (for Qwen MoE models)
+    # Router Calibration arguments (for Qwen/DeepSeek MoE models)
     parser.add_argument("--calibrate_router", default=False, action="store_true",
-                        help="Enable Router Calibration using TopK-MSE loss for Qwen MoE models")
+                        help="Enable Router Calibration using TopK-MSE loss for Qwen/DeepSeek MoE models")
     parser.add_argument("--router_lr", type=float, default=1e-2,
                         help="Learning rate for router calibration (default 1e-2, higher than LWC)")
     parser.add_argument("--router_epochs", type=int, default=5,
